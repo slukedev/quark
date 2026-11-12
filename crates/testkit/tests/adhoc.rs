@@ -44,11 +44,6 @@ async fn run_iq(c: &mut Client, domain: &str, node: &str, fields: &[(&str, &[&st
     c.iq_set(Some(domain), submit).await
 }
 
-/// The XEP-0050 condition of an error, if any.
-fn command_condition(iq: &Element) -> Option<String> {
-    iq.get_child("error", ns::CLIENT)?.children().find(|c| c.ns() == ns::COMMANDS).map(|c| c.name().to_string())
-}
-
 fn note(cmd: &Element) -> String {
     cmd.child_text("note", ns::COMMANDS).unwrap_or_default()
 }
@@ -151,15 +146,13 @@ async fn admins_make_account_invites() -> anyhow::Result<()> {
     let done = run(&mut kim, &d, "urn:xmpp:invite#create-account", &[("username", &["max"]), ("admin", &["1"]), ("days", &["2"])]).await?;
     let x = done.to_xml();
     assert!(x.contains(&format!("xmpp:max@{d}?register;preauth=")), "{x}");
-    // A refusal is an IQ error (XEP-0050 §4.6), not a completed command with a note.
-    let bad = run_iq(&mut kim, &d, "urn:xmpp:invite#create-account", &[("days", &["0"])]).await?;
-    assert_eq!((condition(&bad), command_condition(&bad).as_deref()), ("bad-request".into(), Some("bad-payload")), "{bad}");
-    assert!(bad.to_xml().contains("between"), "{bad}");
+    let bad = run(&mut kim, &d, "urn:xmpp:invite#create-account", &[("days", &["0"])]).await?;
+    assert!(note(&bad).contains("between"), "{bad}");
     Ok(())
 }
 
 #[tokio::test]
-async fn failed_admin_commands_are_errors_and_admins_choose_any_password() -> anyhow::Result<()> {
+async fn failed_admin_commands_say_why_and_admins_choose_any_password() -> anyhow::Result<()> {
     let s = TestServer::start().await?;
     let d = s.domain().to_string();
     s.add_admin("kim", "password-2").await?;
@@ -168,23 +161,24 @@ async fn failed_admin_commands_are_errors_and_admins_choose_any_password() -> an
     let add = format!("{ADMIN}#add-user");
 
     // XEP-0133 leaves password rules to the admin: a short one is their call.
-    let r = run_iq(&mut kim, &d, &add, &[("accountjid", &[&lee]), ("password", &["pw"]), ("password-verify", &["pw"])]).await?;
-    assert_eq!(r.attr("type"), Some("result"), "{r}");
+    let r = run(&mut kim, &d, &add, &[("accountjid", &[&lee]), ("password", &["pw"]), ("password-verify", &["pw"])]).await?;
+    assert_eq!(r.get_child("note", ns::COMMANDS).and_then(|n| n.attr("type")), Some("info"), "{r}");
     assert!(can_sign_in(&s, "lee", "pw").await);
-    let r = run_iq(&mut kim, &d, &format!("{ADMIN}#change-user-password"), &[("accountjid", &[&lee]), ("password", &["x"])]).await?;
-    assert_eq!(r.attr("type"), Some("result"), "{r}");
+    run(&mut kim, &d, &format!("{ADMIN}#change-user-password"), &[("accountjid", &[&lee]), ("password", &["x"])]).await?;
     assert!(can_sign_in(&s, "lee", "x").await);
 
-    // XEP-0050 §4.6: failures are IQ errors.
-    let r = run_iq(&mut kim, &d, &add, &[("accountjid", &[&lee]), ("password", &["password-3"])]).await?;
-    assert_eq!((r.attr("type"), condition(&r).as_str()), (Some("error"), "conflict"), "{r}");
-    let r = run_iq(&mut kim, &d, &add, &[("accountjid", &["max"]), ("password", &["one"]), ("password-verify", &["two"])]).await?;
-    assert_eq!((condition(&r), command_condition(&r).as_deref()), ("bad-request".into(), Some("bad-payload")), "{r}");
-    let r = run_iq(&mut kim, &d, &add, &[("accountjid", &["max"])]).await?;
-    assert_eq!(r.attr("type"), Some("error"), "an empty password: {r}");
+    // A command that can't be done completes with an error note (XEP-0133's examples), which is
+    // where admin clients look.
+    let error_note = |c: &Element| c.get_child("note", ns::COMMANDS).filter(|n| n.attr("type") == Some("error")).is_some();
+    let r = run(&mut kim, &d, &add, &[("accountjid", &[&lee]), ("password", &["password-3"])]).await?;
+    assert!(error_note(&r), "already there: {r}");
+    let r = run(&mut kim, &d, &add, &[("accountjid", &["max"]), ("password", &["one"]), ("password-verify", &["two"])]).await?;
+    assert!(error_note(&r), "mismatched: {r}");
+    let r = run(&mut kim, &d, &add, &[("accountjid", &["max"])]).await?;
+    assert!(error_note(&r), "an empty password: {r}");
     assert!(!s.srv.accounts.exists(&d, "max").await?);
-    let r = run_iq(&mut kim, &d, &format!("{ADMIN}#delete-user"), &[("accountjids", &["ghost"])]).await?;
-    assert_eq!(condition(&r), "item-not-found", "{r}");
+    let r = run(&mut kim, &d, &format!("{ADMIN}#delete-user"), &[("accountjids", &["ghost"])]).await?;
+    assert!(error_note(&r), "{r}");
 
     // People choosing their own passwords still need 8 characters.
     let mut lee_c = s.login("lee", "x").await?;

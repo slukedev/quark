@@ -25,9 +25,9 @@ async fn friend_invite(c: &mut Client, domain: &str) -> anyhow::Result<String> {
 async fn friend_invite_refusal(c: &mut Client, domain: &str) -> anyhow::Result<String> {
     let cmd = Element::new("command", ns::COMMANDS).attr_set("node", "urn:xmpp:invite#invite").attr_set("action", "execute");
     let r = c.iq_set(Some(domain), cmd).await?;
-    // XEP-0050 §4.6: a refused command is an IQ error.
-    anyhow::ensure!(r.attr("type") == Some("error"), "not refused: {r}");
-    Ok(r.get_child("error", ns::CLIENT).and_then(|e| e.child_text("text", "urn:ietf:params:xml:ns:xmpp-stanzas")).unwrap_or_default())
+    let note = r.get_child("command", ns::COMMANDS).and_then(|c| c.get_child("note", ns::COMMANDS)).cloned();
+    anyhow::ensure!(note.as_ref().and_then(|n| n.attr("type")) == Some("error"), "not refused: {r}");
+    Ok(note.map(|n| n.text_content()).unwrap_or_default())
 }
 
 /// Signs up `user` with the invite behind `uri`; returns the IQ answer.

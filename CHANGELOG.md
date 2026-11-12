@@ -29,8 +29,8 @@ Quark is now free software under the GNU GPL, version 3 or later, and targets Li
   conditions for kicking, banning and silencing match XEP-0045.
 - FAST tokens follow XEP-0484's two-slot rotation and its error conditions.
 - Bind2 sessions get offline messages from the archive instead of twice (XEP-0386 §3.2).
-- Failed ad-hoc admin commands answer with IQ errors (XEP-0050 §4.6); admins may set any
-  non-empty password through them.
+- Admins may set any non-empty password through XEP-0133 commands, an account lists the server's
+  commands to itself, and "list online users" asks how many first (§4.21).
 - Another user's missing vCard is an error, not an empty card (XEP-0054 §3.3).
 - Closing a stream waits briefly for the client to hang up, so clients don't lose the closing
   tag or a stream error to the TLS close.
