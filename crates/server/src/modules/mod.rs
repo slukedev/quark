@@ -238,9 +238,15 @@ pub trait Module: Send + Sync + 'static {
         Vec::new()
     }
 
-    /// disco#items on an account's bare JID (PEP nodes), for the node asked about.
+    /// disco#items on an account's bare JID without a node (PEP nodes).
     async fn account_items(&self, _cx: &IqCtx<'_>) -> Vec<Element> {
         Vec::new()
+    }
+
+    /// disco#info or disco#items for a `node` on the account `cx.to` this module owns, e.g. a PEP
+    /// node (XEP-0060 §5.3, §5.5). None when it isn't this module's or the asker may not see it.
+    async fn account_node(&self, _cx: &IqCtx<'_>, _node: &str) -> Option<Vec<Element>> {
+        None
     }
 
     /// disco#items on the server domain (components announce themselves here).

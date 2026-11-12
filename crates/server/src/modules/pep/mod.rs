@@ -1,7 +1,7 @@
 //! Personal Eventing (XEP-0163) on XEP-0060 nodes: avatars, OMEMO keys, bookmarks, nicknames.
 //!
 //! Every account is a pubsub service at its bare JID (IQs without `to` from the account itself
-//! address it too). Items are stored per node; notifications go to the owner's devices and to
+//! address it too); the domain is not one. Items are stored per node; notifications go to the owner's devices and to
 //! contacts that see the owner's presence, filtered by the `+notify` features in their entity
 //! capabilities (XEP-0115), which are looked up once per `ver` and cached. Contacts coming
 //! online get the last item of each node they care about.
@@ -224,9 +224,12 @@ impl Module for Pep {
         vec!["pep", "bookmarks"]
     }
 
-    // Older clients look for PEP on the server rather than the account.
+    // The domain is no pubsub service, so none of the pubsub features: clients would take it for
+    // one (XEP-0060 §5.1). The pubsub/pep identity stays, as older clients (Pidgin, Psi) look
+    // for it on the server to tell whether PEP is there (as XEP-0163 first had it); the
+    // conversions are server features too.
     fn server_features(&self, _host: &Host) -> Vec<&'static str> {
-        FEATURES.to_vec()
+        vec![avatar::CONVERSION, bookmarks::COMPAT, bookmarks::COMPAT_PEP]
     }
 
     fn server_identities(&self, _host: &Host) -> Vec<Identity> {
@@ -261,14 +264,13 @@ impl Module for Pep {
         self.st.disco_items(cx).await
     }
 
+    async fn account_node(&self, cx: &IqCtx<'_>, node: &str) -> Option<Vec<Element>> {
+        self.st.disco_node(cx, node).await
+    }
+
+    // An IQ without `to` is already for the sender's bare JID; one to the domain isn't for PEP.
     fn iq_namespaces(&self) -> &'static [(&'static str, IqTarget)] {
-        &[
-            (ns::PUBSUB, IqTarget::Account),
-            (ns::PUBSUB_OWNER, IqTarget::Account),
-            // No `to`: the sender's own PEP service.
-            (ns::PUBSUB, IqTarget::Server),
-            (ns::PUBSUB_OWNER, IqTarget::Server),
-        ]
+        &[(ns::PUBSUB, IqTarget::Account), (ns::PUBSUB_OWNER, IqTarget::Account)]
     }
 
     async fn handle_iq(&self, cx: &IqCtx<'_>) -> IqResult {

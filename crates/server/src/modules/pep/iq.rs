@@ -138,14 +138,8 @@ impl Viewer {
 
 impl State {
     pub(super) async fn handle_iq(self: &Arc<Self>, cx: &IqCtx<'_>) -> IqResult {
-        let owner = match cx.to.node() {
-            Some(u) => Owner { host: cx.host.domain.clone(), user: u.to_string() },
-            None => match cx.local_sender().as_ref().and_then(Owner::of) {
-                Some(o) => o,
-                // The domain itself has no pubsub service, only its accounts do.
-                None => return Err(StanzaError::service_unavailable()),
-            },
-        };
+        // The domain itself has no pubsub service, only its accounts do.
+        let Some(owner) = Owner::of(cx.to) else { return Err(StanzaError::service_unavailable()) };
         let is_owner = cx.from.to_bare() == owner.jid();
         let Some(op) = cx.payload.first_child() else {
             return Err(StanzaError::bad_request().with_text("The request is empty."));
@@ -824,41 +818,55 @@ impl State {
         ok_empty()
     }
 
-    /// disco#items on the account: the nodes the asker may see, or one node's item ids.
+    /// disco#items on the account: the nodes the asker may see.
     pub(super) async fn disco_items(&self, cx: &IqCtx<'_>) -> Vec<Element> {
         let Some(o) = Owner::of(cx.to) else { return Vec::new() };
         let Ok(viewer) = self.viewer(cx.srv, &o, cx.from).await else { return Vec::new() };
         let owner_jid = o.jid().to_string();
-        let want = cx.payload.attr("node").map(str::to_string);
         let oo = o.clone();
-        let found = cx
+        let Ok(nodes) = cx.srv.db.read(move |c| store::nodes(c, &oo)).await else { return Vec::new() };
+        nodes
+            .into_iter()
+            .filter(|(n, cfg)| viewer.may(n, cfg).is_ok())
+            .map(|(n, cfg)| {
+                Element::new("item", ns::DISCO_ITEMS).attr_set("jid", owner_jid.clone()).attr_set("node", n).attr_opt("name", cfg.title)
+            })
+            .collect()
+    }
+
+    /// disco#info or disco#items on one of the account's nodes: a leaf node with its meta-data
+    /// (XEP-0060 §5.3, §5.4), or its item ids (§5.5). None, which is item-not-found, for a node
+    /// that doesn't exist or that the asker may not see, so the two can't be told apart.
+    pub(super) async fn disco_node(&self, cx: &IqCtx<'_>, node: &str) -> Option<Vec<Element>> {
+        let o = Owner::of(cx.to)?;
+        let viewer = self.viewer(cx.srv, &o, cx.from).await.ok()?;
+        let info = cx.payload.ns() == ns::DISCO_INFO;
+        let (oo, n) = (o.clone(), node.to_string());
+        let (cfg, ids) = cx
             .srv
             .db
             .read(move |c| {
-                let nodes = store::nodes(c, &oo)?;
-                match want {
-                    None => Ok((nodes, Vec::new())),
-                    Some(w) => {
-                        let nodes: Vec<_> = nodes.into_iter().filter(|(n, _)| *n == w).collect();
-                        let ids = if nodes.is_empty() { Vec::new() } else { store::item_ids(c, &oo, &w)? };
-                        Ok((nodes, ids))
-                    }
-                }
+                let Some(cfg) = store::node(c, &oo, &n)? else { return Ok(None) };
+                let ids = if info { Vec::new() } else { store::item_ids(c, &oo, &n)? };
+                Ok(Some((cfg, ids)))
             })
-            .await;
-        let Ok((nodes, ids)) = found else { return Vec::new() };
-        let visible = nodes.into_iter().filter(|(n, cfg)| viewer.may(n, cfg).is_ok());
-        if cx.payload.attr("node").is_none() {
-            return visible
-                .map(|(n, cfg)| {
-                    Element::new("item", ns::DISCO_ITEMS).attr_set("jid", owner_jid.clone()).attr_set("node", n).attr_opt("name", cfg.title)
-                })
-                .collect();
+            .await
+            .map_err(db_err)
+            .ok()??;
+        viewer.may(node, &cfg).ok()?;
+        let owner_jid = o.jid().to_string();
+        if info {
+            return Some(vec![
+                Element::new("identity", ns::DISCO_INFO).attr_set("category", "pubsub").attr_set("type", "leaf"),
+                Element::new("feature", ns::DISCO_INFO).attr_set("var", ns::PUBSUB),
+                cfg.meta_data(&owner_jid),
+            ]);
         }
-        if visible.count() == 0 {
-            return Vec::new();
-        }
-        ids.into_iter().map(|id| Element::new("item", ns::DISCO_ITEMS).attr_set("jid", owner_jid.clone()).attr_set("name", id)).collect()
+        Some(
+            ids.into_iter()
+                .map(|id| Element::new("item", ns::DISCO_ITEMS).attr_set("jid", owner_jid.clone()).attr_set("name", id))
+                .collect(),
+        )
     }
 }
 
