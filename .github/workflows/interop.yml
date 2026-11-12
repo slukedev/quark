@@ -1,0 +1,93 @@
+name: Interop
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: interop-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SINT_VERSION: 1.8.0
+
+jobs:
+  # XMPP Interop Testing: Smack's integration tests for servers (docs/interop.md).
+  smack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked --bin quark
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Start Quark on localhost:5222
+        run: |
+          D=$RUNNER_TEMP/quark
+          mkdir -p "$D/data" "$D/certs"
+          cat > "$D/quark.toml" <<EOF
+          [server]
+          data_dir = "$D/data"
+          log = "quark=info"
+          [[host]]
+          domain = "localhost"
+          admins = ["admin@localhost"]
+          [host.settings]
+          sign_up = "open"
+          [listen]
+          c2s = ["127.0.0.1:5222"]
+          c2s_tls = ["127.0.0.1:5223"]
+          s2s = []
+          s2s_tls = []
+          http = ["127.0.0.1:5280"]
+          [tls]
+          cert_dir = "$D/certs"
+          [http]
+          public_url = "http://localhost:5280"
+          [turn]
+          enabled = false
+          EOF
+          nohup ./target/release/quark --config "$D/quark.toml" > "$D/quark.log" 2>&1 &
+          for _ in $(seq 50); do [ -S "$D/data/admin.sock" ] && break; sleep 0.2; done
+          echo '{"cmd":"account.create","args":{"host":"localhost","user":"admin","password":"adminpassword","role":"admin"}}' \
+            | ./target/release/quark --config "$D/quark.toml" ctl
+          echo "QUARK_DIR=$D" >> "$GITHUB_ENV"
+      - name: Fetch the suite
+        run: |
+          curl -sSfL -o sint.jar "https://github.com/XMPP-Interop-Testing/smack-sint-server-extensions/releases/download/v${SINT_VERSION}/smack-sint-server-extensions-${SINT_VERSION}-jar-with-dependencies.jar"
+          # The jar lists a Java 18+ resolver service without being multi-release; Java 21 aborts on it.
+          zip -q -d sint.jar META-INF/services/java.net.spi.InetAddressResolverProvider
+      - name: Run it
+        # Left out, with the reason:
+        # - FAST and SASL2 low-level classes: Smack's modular connection stalls mid-TLS-handshake at
+        #   random (a client bug); Quark's own suite covers both (blind_sasl2.rs).
+        # - Whitespace during SASL2 is tolerated on purpose, like whitespace keepalives anywhere.
+        # - Upload URLs are http here; production runs behind a TLS proxy.
+        # - Listing room occupants in disco#items is a MAY (XEP-0045 §6.5); Quark keeps it private.
+        # - A blank owner list in the room form is ignored rather than refused, so a client that
+        #   resubmits the form without it can't orphan the room.
+        # - Owner lists of semi-anonymous rooms stay hidden from participants (they'd expose JIDs).
+        run: |
+          java \
+            -Dsinttest.service=localhost -Dsinttest.host=127.0.0.1 \
+            -Dsinttest.securityMode=required -Dsinttest.acceptAllCertificates=true \
+            -Dsinttest.adminAccountUsername=admin -Dsinttest.adminAccountPassword=adminpassword \
+            -Dsinttest.enabledConnections=tcp -Dsinttest.replyTimeout=5000 \
+            -Dsinttest.disabledTests=FastLowLevelIntegrationTest,FastNegotiationIntegrationTest,FastIntegrationTest,Sasl2NegotiationLowLevelIntegrationTest,Sasl2NegotiationIntegrationTest,EntityCapsTest,HttpFileUploadExtIntegrationTest.testSlotResponseGetUrlProvideTLS,HttpFileUploadExtIntegrationTest.testSlotResponsePutUrlProvideTLS,MultiUserChatEntityIntegrationTest.mucTestForDiscoveringRoomItems,MultiUserChatOwnerConfigRoomIntegrationTest.testRoomConfigRemoveLastOwner,MultiUserChatOwnerIntegrationTest.testRoomHasOwnerAfterOriginalOwnerLeaves \
+            -Dsinttest.debugger=org.igniterealtime.smack.inttest.util.ModifiedStandardSinttestDebuggerMetaFactory \
+            -DlogDir="$PWD/sint-logs" \
+            -jar sint.jar
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sint-logs
+          path: |
+            sint-logs/
+            ${{ env.QUARK_DIR }}/quark.log
