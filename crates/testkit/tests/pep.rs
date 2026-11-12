@@ -140,24 +140,97 @@ fn error_of(r: &Element) -> (String, String) {
     (cond.unwrap_or_default(), app.unwrap_or_default())
 }
 
+fn has_identity(q: &Element, category: &str, kind: &str) -> bool {
+    q.children().any(|c| c.name() == "identity" && c.attr("category") == Some(category) && c.attr("type") == Some(kind))
+}
+
+/// The account is the pubsub service (XEP-0163 §3). The domain keeps only the pubsub/pep
+/// identity older clients look for there; it used to list the pubsub features too, which made
+/// clients (Smack) take it for a pubsub service (XEP-0060 §5.1) whose nodes were the sender's.
 #[tokio::test]
-async fn accounts_and_the_server_advertise_pep() -> anyhow::Result<()> {
+async fn accounts_advertise_pep_and_the_domain_is_no_pubsub_service() -> anyhow::Result<()> {
     let s = server(&["alice"]).await?;
     let mut alice = s.login("alice", PW).await?;
-    for to in [jid("alice"), DOMAIN.to_string()] {
-        let r = alice.iq_get(Some(&to), Element::new("query", ns::DISCO_INFO)).await?;
-        let q = r.get_child("query", ns::DISCO_INFO).expect("disco#info result");
-        assert!(
-            q.children().any(|c| c.name() == "identity" && c.attr("category") == Some("pubsub") && c.attr("type") == Some("pep")),
-            "{q}"
-        );
-        let features: Vec<&str> = q.children().filter_map(|c| c.attr("var")).collect();
-        for f in ["publish-options", "auto-create", "config-node-max", "last-published", "multi-items", "item-ids", "access-whitelist"] {
-            assert!(features.contains(&format!("http://jabber.org/protocol/pubsub#{f}").as_str()), "{f} missing on {to}");
-        }
-        assert!(features.contains(&"urn:xmpp:pep-vcard-conversion:0"));
-        assert!(features.contains(&"urn:xmpp:bookmarks:1#compat"));
+    let r = alice.iq_get(Some(&jid("alice")), Element::new("query", ns::DISCO_INFO)).await?;
+    let q = r.get_child("query", ns::DISCO_INFO).expect("disco#info result");
+    assert!(has_identity(q, "pubsub", "pep"), "{q}");
+    let features: Vec<&str> = q.children().filter_map(|c| c.attr("var")).collect();
+    assert!(features.contains(&ns::PUBSUB));
+    for f in ["publish-options", "auto-create", "config-node-max", "last-published", "multi-items", "item-ids", "access-whitelist"] {
+        assert!(features.contains(&format!("http://jabber.org/protocol/pubsub#{f}").as_str()), "{f} missing");
     }
+    assert!(features.contains(&"urn:xmpp:bookmarks:1#compat"));
+
+    let r = alice.iq_get(Some(DOMAIN), Element::new("query", ns::DISCO_INFO)).await?;
+    let q = r.get_child("query", ns::DISCO_INFO).expect("disco#info result");
+    assert!(has_identity(q, "pubsub", "pep"), "{q}");
+    assert!(!has_identity(q, "pubsub", "service"), "{q}");
+    let features: Vec<&str> = q.children().filter_map(|c| c.attr("var")).collect();
+    assert!(!features.iter().any(|f| f.starts_with(ns::PUBSUB)), "{q}");
+    assert!(features.contains(&"urn:xmpp:pep-vcard-conversion:0"));
+
+    // Pubsub requests to the domain don't reach anyone's PEP.
+    let create = pubsub(Element::new("create", ns::PUBSUB).attr_set("node", "shared-node"));
+    assert_eq!(error_of(&alice.iq_set(Some(DOMAIN), create).await?).0, "service-unavailable");
+    assert_eq!(error_of(&alice.iq_set(Some(DOMAIN), publish(NICK, None, nick("A"))).await?).0, "service-unavailable");
+    let owner = Element::new("pubsub", ns::PUBSUB_OWNER).child(Element::new("default", ns::PUBSUB_OWNER));
+    assert_eq!(error_of(&alice.iq_get(Some(DOMAIN), owner).await?).0, "service-unavailable");
+    assert_eq!(error_of(&alice.iq_get(None, items("shared-node")).await?).0, "item-not-found");
+    assert_eq!(error_of(&alice.iq_get(None, items(NICK)).await?).0, "item-not-found");
+    // Without `to` it's still her own.
+    let create = pubsub(Element::new("create", ns::PUBSUB).attr_set("node", "mine"));
+    assert_eq!(alice.iq_set(None, create).await?.attr("type"), Some("result"));
+    Ok(())
+}
+
+/// disco#info and disco#items on a PEP node describe the node (XEP-0060 §5.3-§5.5), not the
+/// account, and a node that doesn't exist or can't be seen is item-not-found (XEP-0030 §3.1).
+/// Smack fetches OMEMO and OpenPGP nodes only after this says pubsub/leaf.
+#[tokio::test]
+async fn disco_on_a_pep_node_describes_the_node() -> anyhow::Result<()> {
+    let s = server(&["alice", "bob", "eve"]).await?;
+    s.make_contacts("alice", "bob").await?;
+    let mut alice = online(&s, "alice", "phone", &[]).await?;
+    alice.iq_set(None, publish(NICK, Some("current"), nick("Alice"))).await?;
+    alice.iq_set(None, publish(DEVICES, Some("current"), devices(&[1]))).await?;
+    let mut bob = online(&s, "bob", "pc", &[]).await?;
+    let mut eve = online(&s, "eve", "pc", &[]).await?;
+    let info = |node: &str| Element::new("query", ns::DISCO_INFO).attr_set("node", node);
+    let disco_items = |node: &str| Element::new("query", ns::DISCO_ITEMS).attr_set("node", node);
+    let names = |r: &Element| -> Vec<String> {
+        r.get_child("query", ns::DISCO_ITEMS)
+            .map(|q| q.children().filter_map(|i| i.attr("name").map(String::from)).collect())
+            .unwrap_or_default()
+    };
+
+    for (c, node) in [(&mut alice, NICK), (&mut bob, NICK), (&mut eve, DEVICES)] {
+        let r = c.iq_get(Some(&jid("alice")), info(node)).await?;
+        let q = r.get_child("query", ns::DISCO_INFO).unwrap_or_else(|| panic!("no info on {node}: {r}"));
+        assert_eq!(q.attr("node"), Some(node));
+        assert!(has_identity(q, "pubsub", "leaf"), "{q}");
+        assert!(!has_identity(q, "account", "registered") && !has_identity(q, "pubsub", "pep"), "{q}");
+        assert!(q.children().any(|f| f.name() == "feature" && f.attr("var") == Some(ns::PUBSUB)), "{q}");
+        let form = q.get_child("x", ns::DATA_FORMS).expect("meta-data form");
+        let field = |var: &str| form.children().find(|f| f.attr("var") == Some(var)).and_then(|f| f.child_text("value", ns::DATA_FORMS));
+        assert_eq!(field("FORM_TYPE").as_deref(), Some("http://jabber.org/protocol/pubsub#meta-data"));
+        assert_eq!(field("pubsub#owner"), Some(jid("alice")));
+
+        let r = c.iq_get(Some(&jid("alice")), disco_items(node)).await?;
+        assert_eq!(r.get_child("query", ns::DISCO_ITEMS).and_then(|q| q.attr("node")), Some(node), "{r}");
+        assert_eq!(names(&r), ["current"]);
+    }
+    assert_eq!(names(&alice.iq_get(Some(&jid("alice")), disco_items(DEVICES)).await?), ["current"]);
+
+    // No such node, or one the asker may not see (presence access, no subscription).
+    for (c, node) in [(&mut alice, "no-such-node"), (&mut bob, "no-such-node"), (&mut eve, NICK)] {
+        assert_eq!(error_of(&c.iq_get(Some(&jid("alice")), info(node)).await?).0, "item-not-found", "info {node}");
+        assert_eq!(error_of(&c.iq_get(Some(&jid("alice")), disco_items(node)).await?).0, "item-not-found", "items {node}");
+    }
+
+    // Without a node it's still the account.
+    let r = bob.iq_get(Some(&jid("alice")), Element::new("query", ns::DISCO_INFO)).await?;
+    let q = r.get_child("query", ns::DISCO_INFO).expect("disco#info result");
+    assert!(has_identity(q, "account", "registered") && q.attr("node").is_none(), "{q}");
     Ok(())
 }
 

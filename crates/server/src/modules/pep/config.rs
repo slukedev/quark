@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 pub const MAX_ITEMS: u32 = 1024;
 
 const NODE_CONFIG: &str = "http://jabber.org/protocol/pubsub#node_config";
+const META_DATA: &str = "http://jabber.org/protocol/pubsub#meta-data";
 pub const PUBLISH_OPTIONS: &str = "http://jabber.org/protocol/pubsub#publish-options";
 
 /// Who may read a node's items and get its notifications.
@@ -227,6 +228,18 @@ impl NodeConfig {
         // Name the first differing field, for the error text.
         let var = differing_field(self, &want);
         Err(BadField(var.to_string()))
+    }
+
+    /// What anyone who may see the node learns about it in disco#info (XEP-0060 §5.4).
+    pub fn meta_data(&self, owner: &str) -> Element {
+        let mut x = Element::new("x", ns::DATA_FORMS).attr_set("type", "result");
+        x.append(field("FORM_TYPE", "hidden", None, &[META_DATA.to_string()]));
+        x.append(field("pubsub#owner", "jid-multi", Some("Node owners"), &[owner.to_string()]));
+        x.append(field("pubsub#access_model", "list-single", Some("Who may see the items"), &[self.access.as_str().to_string()]));
+        x.append(field("pubsub#title", "text-single", Some("A friendly name for the node"), opt(&self.title)));
+        x.append(field("pubsub#description", "text-single", Some("A description of the node"), opt(&self.description)));
+        x.append(field("pubsub#type", "text-single", Some("Payload type"), opt(&self.payload_type)));
+        x
     }
 
     /// The configuration as a form (`type='form'` for owners to edit).

@@ -43,9 +43,10 @@ impl Module for Disco {
         }
         let node = cx.payload.attr("node");
         let server = cx.to.node().is_none();
-        if let Some(n) = node.filter(|_| server) {
+        if let Some(n) = node {
             for m in &cx.srv.modules {
-                if let Some(children) = m.server_node(cx, n).await {
+                let found = if server { m.server_node(cx, n).await } else { m.account_node(cx, n).await };
+                if let Some(children) = found {
                     return ok(Element::new("query", cx.payload.ns()).attr_set("node", n).children_from(children));
                 }
             }
