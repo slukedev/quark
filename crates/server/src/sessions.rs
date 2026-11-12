@@ -24,6 +24,8 @@ pub struct SessionInfo {
     pub transport: &'static str,
     /// The client's software, from SASL2 `<user-agent>` or the resource.
     pub client: Option<String>,
+    /// Bound with Bind2 (XEP-0386): the client catches up from the archive.
+    pub bind2: bool,
 }
 
 /// What other parts of the server need to know about a session right now.

@@ -271,13 +271,20 @@ fn ht_initial_response(user: &str, token: &str) -> String {
 }
 
 async fn fast_authenticate(s: &TestServer, user: &str, ua: &str, token: &str) -> anyhow::Result<(Client, SaslEnd)> {
+    fast_authenticate_with(s, user, token, vec![user_agent(ua), Element::new("fast", FAST), bind2("blind", vec![])]).await
+}
+
+/// An HT-SHA-256-NONE `<authenticate/>` with exactly these children besides the response.
+async fn fast_authenticate_with(s: &TestServer, user: &str, token: &str, children: Vec<Element>) -> anyhow::Result<(Client, SaslEnd)> {
     let mut c = tls_client(s).await?;
-    let auth = Element::new("authenticate", SASL2)
-        .attr_set("mechanism", "HT-SHA-256-NONE")
-        .text_child("initial-response", SASL2, ht_initial_response(user, token))
-        .child(user_agent(ua))
-        .child(Element::new("fast", FAST))
-        .child(bind2("blind", vec![]));
+    let mut auth = Element::new("authenticate", SASL2).attr_set("mechanism", "HT-SHA-256-NONE").text_child(
+        "initial-response",
+        SASL2,
+        ht_initial_response(user, token),
+    );
+    for e in children {
+        auth.append(e);
+    }
     c.send(&auth).await?;
     let r = c.recv().await?;
     let end = if r.is("success", SASL2) {
@@ -324,10 +331,124 @@ async fn fast_wrong_token_fails() -> anyhow::Result<()> {
     let ua = agent_id();
     let token = get_fast_token(&s, &ua).await?;
     let (_c, end) = fast_authenticate(&s, "alice", &ua, &format!("{token}x")).await?;
+    // XEP-0484 §4.2: a token the server doesn't trust fails with credentials-expired, so the
+    // client knows to fall back to its password.
     match end {
-        SaslEnd::Failure(f) => assert_eq!(sasl_failure_condition(&f).as_deref(), Some("not-authorized"), "{f}"),
+        SaslEnd::Failure(f) => assert_eq!(sasl_failure_condition(&f).as_deref(), Some("credentials-expired"), "{f}"),
         other => panic!("wrong FAST token accepted or odd reply: {other:?}"),
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn fast_using_a_new_token_retires_the_earlier_ones() -> anyhow::Result<()> {
+    // XEP-0484 §3.5: a rotated-out token works until the new one is used, then never again.
+    let s = server().await?;
+    let ua = agent_id();
+    let t1 = get_fast_token(&s, &ua).await?;
+    let req = Element::new("request-token", FAST).attr_set("mechanism", "HT-SHA-256-NONE");
+    let (_c, end) =
+        fast_authenticate_with(&s, "alice", &t1, vec![user_agent(&ua), Element::new("fast", FAST), bind2("blind", vec![]), req]).await?;
+    let ok = expect_success(end);
+    let t2 = ok.get_child("token", FAST).and_then(|t| t.attr("token")).unwrap_or_else(|| panic!("no new token: {ok}")).to_string();
+    assert_ne!(t1, t2);
+    // The device may not have got t2: t1 still works.
+    expect_success(fast_authenticate(&s, "alice", &ua, &t1).await?.1);
+    expect_success(fast_authenticate(&s, "alice", &ua, &t2).await?.1);
+    let (_c, end) = fast_authenticate(&s, "alice", &ua, &t1).await?;
+    assert_eq!(end.failure_condition().as_deref(), Some("credentials-expired"), "t1 still works after t2 was used: {end:?}");
+    expect_success(fast_authenticate(&s, "alice", &ua, &t2).await?.1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn fast_mechanism_without_fast_element_is_malformed() -> anyhow::Result<()> {
+    // XEP-0484 §3.4: a token sign-in carries <fast/>.
+    let s = server().await?;
+    let ua = agent_id();
+    let token = get_fast_token(&s, &ua).await?;
+    let (_c, end) = fast_authenticate_with(&s, "alice", &token, vec![user_agent(&ua), bind2("blind", vec![])]).await?;
+    assert_eq!(end.failure_condition().as_deref(), Some("malformed-request"), "{end:?}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn bad_token_requests_fail_before_authenticating() -> anyhow::Result<()> {
+    let s = server().await?;
+    // XEP-0484 §4.1: tokens are per device, so a request needs <user-agent id='…'/>.
+    let mut c = tls_client(&s).await?;
+    let req = Element::new("request-token", FAST).attr_set("mechanism", "HT-SHA-256-NONE");
+    let auth = Element::new("authenticate", SASL2).attr_set("mechanism", "SCRAM-SHA-256").text_child(
+        "initial-response",
+        SASL2,
+        b64("n,,n=alice,r=abcdefgh"),
+    );
+    c.send(&auth.clone().child(req)).await?;
+    let f = c.recv().await?;
+    assert!(f.is("failure", SASL2), "{f}");
+    assert_eq!(sasl_failure_condition(&f).as_deref(), Some("malformed-request"), "{f}");
+    // §3.2: the mechanism must be one the server offered.
+    let req = Element::new("request-token", FAST).attr_set("mechanism", "HT-SHA-256-UNIQ");
+    c.send(&auth.child(user_agent(&agent_id())).child(req)).await?;
+    let f = c.recv().await?;
+    assert_eq!(sasl_failure_condition(&f).as_deref(), Some("invalid-mechanism"), "{f}");
+    // The stream is still usable.
+    expect_success(sasl2_scram(&mut c, "alice", "password1", vec![user_agent(&agent_id())]).await?);
+    Ok(())
+}
+
+// --- Bind2 and offline messages (XEP-0386 §3.2) ---
+
+#[tokio::test]
+async fn bind2_leaves_archived_offline_messages_to_the_archive() -> anyhow::Result<()> {
+    let s = server().await?;
+    s.add_user("carol", "password1").await?;
+    // Alice's archive keeps nothing from carol.
+    let mut a = s.login("alice", "password1").await?;
+    let never = Element::new("never", ns::MAM).text_child("jid", ns::MAM, "carol@quark.test");
+    let r = a
+        .iq_set(None, Element::new("prefs", ns::MAM).attr_set("default", "always").child(Element::new("always", ns::MAM)).child(never))
+        .await?;
+    assert_eq!(r.attr("type"), Some("result"), "{r}");
+    a.close().await?;
+
+    for (who, body) in [("bob", "archived"), ("carol", "not archived")] {
+        let mut c = s.login(who, "password1").await?;
+        c.send(&message("alice@quark.test", "chat", body)).await?;
+        c.iq_get(Some(DOMAIN), Element::new("ping", ns::PING)).await?;
+    }
+
+    let (mut c, _) = sasl2_bind(&s, "alice", &agent_id(), vec![], vec![]).await?;
+    c.send(&Element::new("presence", ns::CLIENT)).await?;
+    let got = drain(&mut c).await?;
+    let bodies: Vec<String> = got.iter().filter_map(|m| m.child_text("body", ns::CLIENT)).collect();
+    // The archived one comes from MAM instead; the one MAM doesn't have is still delivered.
+    assert_eq!(bodies, ["not archived"], "{got:?}");
+    let q = c.iq_set(None, Element::new("query", ns::MAM)).await?;
+    assert_eq!(q.attr("type"), Some("result"), "{q}");
+    let archived: Vec<Element> = drain(&mut c).await?;
+    assert!(archived.iter().any(|m| m.to_xml().contains("archived") && m.to_xml().contains("bob@quark.test")), "{archived:?}");
+    c.close().await?;
+
+    // Cleared, not just skipped: a classic session doesn't get it later either.
+    let mut c = s.login("alice", "password1").await?;
+    c.send(&Element::new("presence", ns::CLIENT)).await?;
+    let got = drain(&mut c).await?;
+    assert!(got.iter().all(|m| m.child_text("body", ns::CLIENT).is_none()), "{got:?}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn bind2_gets_offline_messages_when_history_is_off() -> anyhow::Result<()> {
+    let s = server().await?;
+    s.set_settings(|st| st.history = quark::settings::History::Off).await?;
+    let mut b = s.login("bob", "password1").await?;
+    b.send(&message("alice@quark.test", "chat", "while away")).await?;
+    b.iq_get(Some(DOMAIN), Element::new("ping", ns::PING)).await?;
+    let (mut c, _) = sasl2_bind(&s, "alice", &agent_id(), vec![], vec![]).await?;
+    c.send(&Element::new("presence", ns::CLIENT)).await?;
+    let m = c.expect(|e| e.name() == "message").await?;
+    assert_eq!(m.child_text("body", ns::CLIENT).as_deref(), Some("while away"), "{m}");
     Ok(())
 }
 

@@ -205,13 +205,20 @@ async fn vcard_get_of_another_account() -> anyhow::Result<()> {
     let v = r.get_child("vCard", ns::VCARD).expect("vCard in result");
     assert_eq!(v.child_text("FN", ns::VCARD).as_deref(), Some("Alice Liddell"));
 
-    // XEP-0054 §3.1: no vCard → service-unavailable (older: item-not-found) or an empty vCard.
+    // XEP-0054 §3.3: another user's missing vCard is an error, the same one as for an account
+    // that doesn't exist (service-unavailable; item-not-found before version 1.3).
     let r = b.iq_get(Some(&bare("carol")), Element::new("vCard", ns::VCARD)).await?;
+    assert_error(&r, &["service-unavailable", "item-not-found"]);
+    let nobody = b.iq_get(Some(&bare("nobody")), Element::new("vCard", ns::VCARD)).await?;
+    assert_eq!(error_condition(&r), error_condition(&nobody), "{r} vs {nobody}");
+
+    // §3.1: one's own missing vCard may be an empty one to fill in.
+    let mut c = s.login("carol", PW).await?;
+    let r = c.iq_get(None, Element::new("vCard", ns::VCARD)).await?;
     if r.attr("type") == Some("error") {
-        assert_error(&r, &["service-unavailable", "item-not-found"]);
+        assert_error(&r, &["item-not-found"]);
     } else {
-        let v = r.get_child("vCard", ns::VCARD);
-        assert!(v.is_none_or(|v| v.children().next().is_none()), "carol has no vCard: {r}");
+        assert!(r.get_child("vCard", ns::VCARD).is_some_and(|v| v.children().next().is_none()), "{r}");
     }
     Ok(())
 }

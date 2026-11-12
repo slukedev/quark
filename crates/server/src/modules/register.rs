@@ -14,7 +14,7 @@ use quark_core::{ns, Condition, Element, Jid, StanzaError};
 
 use super::forms::{Form, Values};
 use super::{invites, ok, ok_empty, Event, IqCtx, IqReply, IqResult, IqTarget, Module};
-use crate::accounts::{AccountError, Role};
+use crate::accounts::{AccountError, Role, SetBy};
 use crate::db::{params, DbError, Migration};
 use crate::server::{Host, Server};
 use crate::settings::SignUp;
@@ -176,7 +176,19 @@ pub fn close_sessions(srv: &Server, bare: &Jid, condition: &'static str, text: &
 
 /// Creates an account and tells the modules (welcome message, invites…).
 pub async fn create_account(srv: &Arc<Server>, host: &Arc<Host>, user: &str, password: &str, role: Role) -> Result<(), AccountError> {
-    srv.accounts.create(&host.domain, user, password, role).await?;
+    create_account_by(srv, host, user, password, role, SetBy::Owner).await
+}
+
+/// [`create_account`], with the password rules for whoever chose the password.
+pub async fn create_account_by(
+    srv: &Arc<Server>,
+    host: &Arc<Host>,
+    user: &str,
+    password: &str,
+    role: Role,
+    by: SetBy,
+) -> Result<(), AccountError> {
+    srv.accounts.create_by(&host.domain, user, password, role, by).await?;
     host.set_role_cache(user, role);
     srv.emit(&Event::AccountCreated { jid: Jid::bare_unchecked(user, &host.domain) }).await;
     Ok(())
@@ -205,7 +217,19 @@ pub async fn change_password(
     password: &str,
     close: Option<&str>,
 ) -> Result<usize, AccountError> {
-    srv.accounts.set_password(&host.domain, user, password).await?;
+    change_password_by(srv, host, user, password, close, SetBy::Owner).await
+}
+
+/// [`change_password`], with the password rules for whoever chose the password.
+pub async fn change_password_by(
+    srv: &Arc<Server>,
+    host: &Arc<Host>,
+    user: &str,
+    password: &str,
+    close: Option<&str>,
+    by: SetBy,
+) -> Result<usize, AccountError> {
+    srv.accounts.set_password_by(&host.domain, user, password, by).await?;
     srv.fast_tokens.revoke_all(&host.domain, user).await?;
     Ok(match close {
         Some(why) => close_sessions(srv, &Jid::bare_unchecked(user, &host.domain), "reset", why),

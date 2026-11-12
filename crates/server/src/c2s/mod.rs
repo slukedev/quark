@@ -195,8 +195,14 @@ async fn serve_counted(srv: Arc<Server>, mut t: Box<dyn Transport>, slot: Option
     };
     match outcome {
         Outcome::Bound(b) => {
-            let info =
-                SessionInfo { ip: t.peer(), secure: t.secure(), since: quark_core::time::now_ms(), transport: t.kind(), client: b.client };
+            let info = SessionInfo {
+                ip: t.peer(),
+                secure: t.secure(),
+                since: quark_core::time::now_ms(),
+                transport: t.kind(),
+                client: b.client,
+                bind2: b.bind2,
+            };
             let (reader, writer) = t.split();
             let handle = session::spawn(session::Start {
                 srv: srv.clone(),
@@ -240,6 +246,7 @@ struct Bound {
     carbons: bool,
     inactive: bool,
     sm: Option<bool>,
+    bind2: bool,
 }
 
 enum Outcome {
@@ -254,7 +261,10 @@ struct Inline {
     software: Option<String>,
     bind: Option<Element>,
     resume: Option<Element>,
+    /// The FAST mechanism of a `<request-token/>`, checked before authenticating.
     request_token: Option<String>,
+    /// Whether a `<fast/>` element says the client signs in with a token.
+    fast: bool,
     fast_invalidate: bool,
 }
 
@@ -297,6 +307,11 @@ fn failure_el(ns_: &str, f: Failure, text: Option<&str>) -> Element {
         e.append(Element::new("text", ns_).text(t));
     }
     e
+}
+
+/// FAST mechanisms offered on this connection.
+fn fast_mechanisms(t: &dyn Transport) -> Vec<&'static str> {
+    sasl::FAST_MECHANISMS.into_iter().filter(|m| *m != "HT-SHA-256-ENDP" || t.bindings().server_end_point.is_some()).collect()
 }
 
 fn decode_b64(text: &str) -> Option<Vec<u8>> {
@@ -431,12 +446,8 @@ impl Negotiation {
                         .children_from(kinds.iter().map(|k| Element::new("channel-binding", ns::CHANNEL_BINDING).attr_set("type", *k))),
                 );
             }
-            let mut fast = Element::new("fast", ns::FAST);
-            for m in sasl::FAST_MECHANISMS {
-                if m != "HT-SHA-256-ENDP" || t.bindings().server_end_point.is_some() {
-                    fast.append(Element::new("mechanism", ns::FAST).text(m));
-                }
-            }
+            let fast = Element::new("fast", ns::FAST)
+                .children_from(fast_mechanisms(t).into_iter().map(|m| Element::new("mechanism", ns::FAST).text(m)));
             let bind_inline = Element::new("inline", ns::BIND2)
                 .children_from([ns::CARBONS, ns::CSI, ns::SM].map(|v| Element::new("feature", ns::BIND2).attr_set("var", v)));
             f.append(
@@ -513,13 +524,32 @@ impl Negotiation {
                     None => None,
                 };
                 let ua = el.get_child("user-agent", ns::SASL2);
+                let agent_id = ua.and_then(|u| u.attr("id")).map(str::to_string);
+                let fast = el.get_child("fast", ns::FAST);
+                let request = el.get_child("request-token", ns::FAST);
+                // A token request is checked before authenticating (XEP-0484 §3.2, §4.1): it
+                // needs the device's id, and one of the mechanisms we offered.
+                if let Some(r) = request {
+                    let refusal = match r.attr("mechanism") {
+                        _ if agent_id.is_none() => Some((Failure::MalformedRequest, "A FAST token needs a <user-agent/> with an id.")),
+                        Some(m) if fast_mechanisms(t).contains(&m) => None,
+                        _ => Some((Failure::InvalidMechanism, "That FAST mechanism isn't offered here.")),
+                    };
+                    if let Some((f, text)) = refusal {
+                        self.sasl = None;
+                        self.sasl2 = None;
+                        t.send(&failure_el(ns::SASL2, f, Some(text))).await.map_err(|_| None)?;
+                        return Ok(None);
+                    }
+                }
                 self.sasl2 = Some(Inline {
-                    agent_id: ua.and_then(|u| u.attr("id")).map(str::to_string),
+                    agent_id,
                     software: ua.and_then(|u| u.child_text("software", ns::SASL2)),
                     bind: el.get_child("bind", ns::BIND2).cloned(),
                     resume: el.get_child("resume", ns::SM).cloned(),
-                    request_token: el.get_child("request-token", ns::FAST).and_then(|r| r.attr("mechanism")).map(str::to_string),
-                    fast_invalidate: el.get_child("fast", ns::FAST).is_some_and(|f| matches!(f.attr("invalidate"), Some("true" | "1"))),
+                    request_token: request.and_then(|r| r.attr("mechanism")).map(str::to_string),
+                    fast: fast.is_some(),
+                    fast_invalidate: fast.is_some_and(|f| matches!(f.attr("invalidate"), Some("true" | "1"))),
                 });
                 self.client = self.sasl2.as_ref().and_then(|i| i.software.clone());
                 self.start_sasl(t, &host, &mech, initial.as_deref()).await
@@ -604,9 +634,17 @@ impl Negotiation {
             return Ok(None);
         }
         let offered = sasl::mechanisms(t.bindings(), t.secure());
+        let ns_ = if self.sasl2.is_some() { ns::SASL2 } else { ns::SASL };
         if !offered.contains(&mech) && !(self.sasl2.is_some() && mech.starts_with("HT-SHA-256-")) {
-            let ns_ = if self.sasl2.is_some() { ns::SASL2 } else { ns::SASL };
             t.send(&failure_el(ns_, Failure::InvalidMechanism, None)).await.map_err(|_| None)?;
+            return Ok(None);
+        }
+        // XEP-0484 §3.4: a token sign-in says so with <fast/>.
+        if mech.starts_with("HT-") && !self.sasl2.as_ref().is_some_and(|i| i.fast) {
+            self.sasl2 = None;
+            t.send(&failure_el(ns_, Failure::MalformedRequest, Some("Signing in with a FAST token needs <fast/>.")))
+                .await
+                .map_err(|_| None)?;
             return Ok(None);
         }
         self.mechanism = Some(mech.to_string());
@@ -640,8 +678,9 @@ impl Negotiation {
             }
             Step::Failure(f, text) => {
                 self.sasl = None;
-                // Only a wrong secret is a guess; malformed or aborted attempts aren't.
-                if f == Failure::NotAuthorized {
+                // Only a wrong secret (password or FAST token) is a guess; malformed or aborted
+                // attempts aren't.
+                if matches!(f, Failure::NotAuthorized | Failure::CredentialsExpired) {
                     self.srv.auth_limiter.failed(t.peer());
                 }
                 self.srv.stats.auth_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -685,7 +724,7 @@ impl Negotiation {
             if inline.fast_invalidate {
                 let _ = self.srv.fast_tokens.revoke(&host.domain, user, agent).await;
             }
-            if let Some(mech) = inline.request_token.as_deref().filter(|m| sasl::FAST_MECHANISMS.contains(m)) {
+            if let Some(mech) = inline.request_token.as_deref() {
                 if let Ok((token, expiry)) = self.srv.fast_tokens.issue(&host.domain, user, agent, mech).await {
                     success.append(
                         Element::new("token", ns::FAST).attr_set("token", token).attr_set("expiry", quark_core::time::xep82(expiry)),
@@ -740,6 +779,7 @@ impl Negotiation {
             carbons,
             inactive,
             sm,
+            bind2: true,
         })))
     }
 
@@ -828,6 +868,7 @@ impl Negotiation {
             carbons: false,
             inactive: false,
             sm: None,
+            bind2: false,
         })))
     }
 }

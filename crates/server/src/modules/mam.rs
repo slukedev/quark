@@ -585,6 +585,33 @@ pub async fn fetch(srv: &Server, archive: &Jid, ids: &[String]) -> Vec<(String, 
     })
 }
 
+/// Which of these stanza ids (at most a few thousand) are in `archive`.
+pub async fn archived(srv: &Server, archive: &Jid, ids: Vec<String>) -> HashSet<String> {
+    if ids.is_empty() {
+        return HashSet::new();
+    }
+    settle(srv).await;
+    let jid = archive.to_bare().to_string();
+    let r = srv
+        .db
+        .read(move |c| {
+            let mut st = c.prepare_cached("SELECT 1 FROM mam m JOIN mam_archives a ON a.id = m.archive WHERE a.jid = ?1 AND m.id = ?2")?;
+            let mut out = HashSet::new();
+            for id in ids {
+                let Some(n) = decode_id(&id) else { continue };
+                if st.query_row(params![jid, n], |_| Ok(())).optional()?.is_some() {
+                    out.insert(id);
+                }
+            }
+            Ok(out)
+        })
+        .await;
+    r.unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "couldn't read archived messages");
+        HashSet::new()
+    })
+}
+
 /// Replaces an archived message with what `replace` makes of it (a tombstone, XEP-0424 §6 and
 /// XEP-0425 §5), taking it out of the search index. `replace` sees the stored message and
 /// returns None to leave it alone. True when a message was replaced.

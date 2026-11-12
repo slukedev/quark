@@ -13,7 +13,7 @@ use quark_core::{ns, Condition, Element, Jid, StanzaError};
 
 use super::forms::{Form, Values};
 use super::{invites, ok, register, IqCtx, IqResult, IqTarget, Module};
-use crate::accounts::{AccountError, Role};
+use crate::accounts::{AccountError, Role, SetBy};
 use crate::server::{Host, Server};
 use crate::settings::SignUp;
 
@@ -177,8 +177,21 @@ fn info(text: impl Into<String>) -> Out {
     Out::Done { note: Some(("info", text.into())), result: None }
 }
 
-fn problem(text: impl Into<String>) -> Out {
-    Out::Done { note: Some(("error", text.into())), result: None }
+/// A submitted form the command can't act on. XEP-0050 §4.6: a failed command is an IQ error,
+/// not a completed one with a note.
+fn bad_input(text: impl Into<String>) -> StanzaError {
+    StanzaError::bad_request().with_text(text).with_app(Element::new("bad-payload", ns::COMMANDS))
+}
+
+/// An account change that was refused.
+fn refused(e: AccountError) -> StanzaError {
+    let text = e.to_string();
+    match e {
+        AccountError::Exists(_) => StanzaError::new(Condition::Conflict).with_text(text),
+        AccountError::NotFound(_) => StanzaError::item_not_found().with_text(text),
+        AccountError::Invalid(_) => StanzaError::new(Condition::NotAcceptable).with_text(text),
+        AccountError::Db(_) => StanzaError::internal(),
+    }
 }
 
 /// A field's first value, trimmed; None when empty.
@@ -254,7 +267,7 @@ async fn run(cx: &IqCtx<'_>, node: &str, input: Option<Values>, complete: bool) 
                 reusable: false,
                 reset: false,
             };
-            invite_result(srv, n, "Send this link to the person you want to chat with.").await.map_err(|e| internal(&e))?
+            invite_result(srv, n, "Send this link to the person you want to chat with.").await.map_err(|e| internal(&e))??
         }
         (true, "create-account", None) if !complete => Out::Form(
             form(
@@ -275,7 +288,7 @@ async fn run(cx: &IqCtx<'_>, node: &str, input: Option<Values>, complete: bool) 
             let days = match one(&v, "days").map(str::parse::<u32>) {
                 None => 7,
                 Some(Ok(d)) if (1..=3650).contains(&d) => d,
-                Some(_) => return Ok(problem("Invites last between 1 and 3650 days.")),
+                Some(_) => return Err(bad_input("Invites last between 1 and 3650 days.")),
             };
             let n = invites::NewInvite {
                 host: &host.domain,
@@ -287,7 +300,7 @@ async fn run(cx: &IqCtx<'_>, node: &str, input: Option<Values>, complete: bool) 
                 reset: false,
             };
             tracing::info!(target: "quark::audit", by = %admin, host = %host.domain, "invite created over ad-hoc");
-            invite_result(srv, n, "Send this link to the person you're inviting.").await.map_err(|e| internal(&e))?
+            invite_result(srv, n, "Send this link to the person you're inviting.").await.map_err(|e| internal(&e))??
         }
         (false, "add-user", None) => Out::Form(
             form("form", "Add a user", Some("Choose the address and a password for the new account."), ADMIN)
@@ -301,20 +314,20 @@ async fn run(cx: &IqCtx<'_>, node: &str, input: Option<Values>, complete: bool) 
         (false, "add-user", Some(v)) => {
             let user = match usernames(host, v.all("accountjid")) {
                 Ok(u) if u.len() == 1 => u.into_iter().next().unwrap_or_default(),
-                Ok(_) => return Ok(problem("Give exactly one address.")),
-                Err(e) => return Ok(problem(e)),
+                Ok(_) => return Err(bad_input("Give exactly one address.")),
+                Err(e) => return Err(bad_input(e)),
             };
             let pw = password(&v, "password").unwrap_or_default();
             if password(&v, "password-verify").is_some_and(|p| p != pw) {
-                return Ok(problem("The passwords don't match."));
+                return Err(bad_input("The passwords don't match."));
             }
-            match register::create_account(srv, host, &user, pw, Role::Member).await {
+            match register::create_account_by(srv, host, &user, pw, Role::Member, SetBy::Admin).await {
                 Ok(()) => {
                     tracing::info!(target: "quark::audit", by = %admin, account = %format!("{user}@{}", host.domain), "account created over ad-hoc");
                     info(format!("Created {user}@{}.", host.domain))
                 }
                 Err(AccountError::Db(e)) => return Err(internal(&e)),
-                Err(e) => problem(e.to_string()),
+                Err(e) => return Err(refused(e)),
             }
         }
         (false, "delete-user", None) => accountjids_form("Delete users", "Everything stored for these accounts is deleted."),
@@ -324,8 +337,8 @@ async fn run(cx: &IqCtx<'_>, node: &str, input: Option<Values>, complete: bool) 
         (false, c @ ("delete-user" | "disable-user" | "reenable-user" | "end-user-session"), Some(v)) => {
             let users = match usernames(host, v.all("accountjids")) {
                 Ok(u) if !u.is_empty() => u,
-                Ok(_) => return Ok(problem("Give at least one address.")),
-                Err(e) => return Ok(problem(e)),
+                Ok(_) => return Err(bad_input("Give at least one address.")),
+                Err(e) => return Err(bad_input(e)),
             };
             let mut missing = Vec::new();
             let mut done = 0usize;
@@ -347,6 +360,9 @@ async fn run(cx: &IqCtx<'_>, node: &str, input: Option<Values>, complete: bool) 
                     Ok(false) | Err(AccountError::NotFound(_)) => missing.push(format!("{u}@{}", host.domain)),
                     Err(e) => return Err(internal(&e)),
                 }
+            }
+            if done == 0 {
+                return Err(StanzaError::item_not_found().with_text(format!("Not found: {}.", missing.join(", "))));
             }
             tracing::info!(target: "quark::audit", by = %admin, command = c, accounts = ?users, "accounts changed over ad-hoc");
             let verb = match c {
@@ -372,15 +388,16 @@ async fn run(cx: &IqCtx<'_>, node: &str, input: Option<Values>, complete: bool) 
         (false, "change-user-password", Some(v)) => {
             let user = match usernames(host, v.all("accountjid")) {
                 Ok(u) if u.len() == 1 => u.into_iter().next().unwrap_or_default(),
-                Ok(_) => return Ok(problem("Give exactly one address.")),
-                Err(e) => return Ok(problem(e)),
+                Ok(_) => return Err(bad_input("Give exactly one address.")),
+                Err(e) => return Err(bad_input(e)),
             };
-            match register::change_password(
+            match register::change_password_by(
                 srv,
                 host,
                 &user,
                 password(&v, "password").unwrap_or_default(),
                 Some("An admin changed the password."),
+                SetBy::Admin,
             )
             .await
             {
@@ -389,7 +406,7 @@ async fn run(cx: &IqCtx<'_>, node: &str, input: Option<Values>, complete: bool) 
                     info(format!("Changed the password of {user}@{}.", host.domain))
                 }
                 Err(AccountError::Db(e)) => return Err(internal(&e)),
-                Err(e) => problem(e.to_string()),
+                Err(e) => return Err(refused(e)),
             }
         }
         (false, "get-online-users-list", _) => {
@@ -437,10 +454,10 @@ async fn run(cx: &IqCtx<'_>, node: &str, input: Option<Values>, complete: bool) 
         (false, "announce", Some(v)) => {
             let body = v.all("announcement").join("\n");
             if body.trim().is_empty() {
-                return Ok(problem("Write a message first."));
+                return Err(bad_input("Write a message first."));
             }
             if body.len() > MAX_ANNOUNCE {
-                return Ok(problem("That message is too long."));
+                return Err(StanzaError::new(Condition::NotAcceptable).with_text("That message is too long."));
             }
             let n = announce(srv, host, one(&v, "subject"), &body).await;
             tracing::info!(target: "quark::audit", by = %admin, host = %host.domain, recipients = n, "announcement sent");
@@ -465,7 +482,8 @@ pub async fn announce(srv: &Arc<Server>, host: &Host, subject: Option<&str>, bod
     users.len()
 }
 
-async fn invite_result(srv: &Arc<Server>, n: invites::NewInvite<'_>, note: &str) -> Result<Out, crate::db::DbError> {
+/// The invite, or (inside) why it was refused.
+async fn invite_result(srv: &Arc<Server>, n: invites::NewInvite<'_>, note: &str) -> Result<Result<Out, StanzaError>, crate::db::DbError> {
     match invites::create(srv, n).await {
         Ok(inv) => {
             let expire = quark_core::time::xep82(inv.expires);
@@ -474,9 +492,9 @@ async fn invite_result(srv: &Arc<Server>, n: invites::NewInvite<'_>, note: &str)
                 x = x.field("landing-url", "text-single", "Invite page", Some(p));
             }
             x = x.field("expire", "text-single", "Valid until", Some(&expire));
-            Ok(Out::Done { note: Some(("info", note.to_string())), result: Some(x.build()) })
+            Ok(Ok(Out::Done { note: Some(("info", note.to_string())), result: Some(x.build()) }))
         }
-        Err(invites::InviteError::Invalid(t)) => Ok(problem(t)),
+        Err(invites::InviteError::Invalid(t)) => Ok(Err(StanzaError::new(Condition::NotAcceptable).with_text(t))),
         Err(invites::InviteError::Db(e)) => Err(e),
     }
 }

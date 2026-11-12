@@ -997,7 +997,7 @@ mod tests {
     }
 
     fn start(srv: &Arc<Server>, writer: Box<dyn StanzaWriter>, reader: Box<dyn StanzaReader>, sm: Option<bool>) -> Arc<SessionHandle> {
-        let info = SessionInfo { ip: None, secure: true, since: 0, transport: "tcp", client: None };
+        let info = SessionInfo { ip: None, secure: true, since: 0, transport: "tcp", client: None, bind2: false };
         spawn(Start {
             srv: srv.clone(),
             host: srv.host("a.test").unwrap(),

@@ -17,10 +17,16 @@ async fn command_nodes(c: &mut Client, domain: &str) -> anyhow::Result<Vec<Strin
 
 /// Runs a command in one step with these fields; returns the `<command/>`.
 async fn run(c: &mut Client, domain: &str, node: &str, fields: &[(&str, &[&str])]) -> anyhow::Result<Element> {
+    let r = run_iq(c, domain, node, fields).await?;
+    r.get_child("command", ns::COMMANDS).cloned().ok_or_else(|| anyhow::anyhow!("refused: {r}"))
+}
+
+/// [`run`], returning the final IQ (a result or an error).
+async fn run_iq(c: &mut Client, domain: &str, node: &str, fields: &[(&str, &[&str])]) -> anyhow::Result<Element> {
     let first = c.iq_set(Some(domain), Element::new("command", ns::COMMANDS).attr_set("node", node).attr_set("action", "execute")).await?;
     let cmd = first.get_child("command", ns::COMMANDS).cloned().ok_or_else(|| anyhow::anyhow!("refused: {first}"))?;
     if cmd.attr("status") == Some("completed") {
-        return Ok(cmd);
+        return Ok(first);
     }
     let mut x = Element::new("x", ns::DATA_FORMS).attr_set("type", "submit");
     for (var, vals) in fields {
@@ -35,8 +41,12 @@ async fn run(c: &mut Client, domain: &str, node: &str, fields: &[(&str, &[&str])
         .attr_set("sessionid", cmd.attr("sessionid").unwrap_or_default())
         .attr_set("action", "complete")
         .child(x);
-    let r = c.iq_set(Some(domain), submit).await?;
-    r.get_child("command", ns::COMMANDS).cloned().ok_or_else(|| anyhow::anyhow!("refused: {r}"))
+    c.iq_set(Some(domain), submit).await
+}
+
+/// The XEP-0050 condition of an error, if any.
+fn command_condition(iq: &Element) -> Option<String> {
+    iq.get_child("error", ns::CLIENT)?.children().find(|c| c.ns() == ns::COMMANDS).map(|c| c.name().to_string())
 }
 
 fn note(cmd: &Element) -> String {
@@ -141,7 +151,49 @@ async fn admins_make_account_invites() -> anyhow::Result<()> {
     let done = run(&mut kim, &d, "urn:xmpp:invite#create-account", &[("username", &["max"]), ("admin", &["1"]), ("days", &["2"])]).await?;
     let x = done.to_xml();
     assert!(x.contains(&format!("xmpp:max@{d}?register;preauth=")), "{x}");
-    let bad = run(&mut kim, &d, "urn:xmpp:invite#create-account", &[("days", &["0"])]).await?;
-    assert!(note(&bad).contains("between"), "{bad}");
+    // A refusal is an IQ error (XEP-0050 §4.6), not a completed command with a note.
+    let bad = run_iq(&mut kim, &d, "urn:xmpp:invite#create-account", &[("days", &["0"])]).await?;
+    assert_eq!((condition(&bad), command_condition(&bad).as_deref()), ("bad-request".into(), Some("bad-payload")), "{bad}");
+    assert!(bad.to_xml().contains("between"), "{bad}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_admin_commands_are_errors_and_admins_choose_any_password() -> anyhow::Result<()> {
+    let s = TestServer::start().await?;
+    let d = s.domain().to_string();
+    s.add_admin("kim", "password-2").await?;
+    let mut kim = s.login("kim", "password-2").await?;
+    let lee = format!("lee@{d}");
+    let add = format!("{ADMIN}#add-user");
+
+    // XEP-0133 leaves password rules to the admin: a short one is their call.
+    let r = run_iq(&mut kim, &d, &add, &[("accountjid", &[&lee]), ("password", &["pw"]), ("password-verify", &["pw"])]).await?;
+    assert_eq!(r.attr("type"), Some("result"), "{r}");
+    assert!(can_sign_in(&s, "lee", "pw").await);
+    let r = run_iq(&mut kim, &d, &format!("{ADMIN}#change-user-password"), &[("accountjid", &[&lee]), ("password", &["x"])]).await?;
+    assert_eq!(r.attr("type"), Some("result"), "{r}");
+    assert!(can_sign_in(&s, "lee", "x").await);
+
+    // XEP-0050 §4.6: failures are IQ errors.
+    let r = run_iq(&mut kim, &d, &add, &[("accountjid", &[&lee]), ("password", &["password-3"])]).await?;
+    assert_eq!((r.attr("type"), condition(&r).as_str()), (Some("error"), "conflict"), "{r}");
+    let r = run_iq(&mut kim, &d, &add, &[("accountjid", &["max"]), ("password", &["one"]), ("password-verify", &["two"])]).await?;
+    assert_eq!((condition(&r), command_condition(&r).as_deref()), ("bad-request".into(), Some("bad-payload")), "{r}");
+    let r = run_iq(&mut kim, &d, &add, &[("accountjid", &["max"])]).await?;
+    assert_eq!(r.attr("type"), Some("error"), "an empty password: {r}");
+    assert!(!s.srv.accounts.exists(&d, "max").await?);
+    let r = run_iq(&mut kim, &d, &format!("{ADMIN}#delete-user"), &[("accountjids", &["ghost"])]).await?;
+    assert_eq!(condition(&r), "item-not-found", "{r}");
+
+    // People choosing their own passwords still need 8 characters.
+    let mut lee_c = s.login("lee", "x").await?;
+    let r = lee_c
+        .iq_set(
+            Some(&d),
+            Element::new("query", ns::REGISTER).text_child("username", ns::REGISTER, "lee").text_child("password", ns::REGISTER, "short"),
+        )
+        .await?;
+    assert_eq!(r.attr("type"), Some("error"), "{r}");
     Ok(())
 }

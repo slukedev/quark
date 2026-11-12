@@ -89,12 +89,22 @@ pub enum Step {
     Refused(Failure),
 }
 
+/// A FAST token secret that is still valid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Token {
+    pub secret: Vec<u8>,
+    /// The newest token of its device (not yet known to have reached it, or in use).
+    pub newest: bool,
+}
+
 /// Something that can check FAST tokens (XEP-0484); implemented by the FAST store.
 #[async_trait::async_trait]
 pub trait TokenCheck: Send + Sync {
-    /// Valid token secrets for `user` with this mechanism: the newest, and the previous one still
-    /// accepted while a rotation is in flight.
-    async fn tokens(&self, host: &str, user: &str, mechanism: &str) -> Vec<Vec<u8>>;
+    /// Valid tokens of `user` for this mechanism, newest first: per device the newest, and the
+    /// one in use while a rotation is in flight.
+    async fn tokens(&self, host: &str, user: &str, mechanism: &str) -> Vec<Token>;
+    /// A newest token was used to sign in: earlier ones of that device stop working.
+    async fn used(&self, host: &str, user: &str, secret: &[u8]);
 }
 
 pub struct Context<'a> {
@@ -314,14 +324,18 @@ async fn fast(ctx: &Context<'_>, mechanism: &str, initial: &[u8]) -> Step {
     let mut msg = b"Initiator".to_vec();
     msg.extend_from_slice(cb);
     for token in tokens.tokens(ctx.host, &user, mechanism).await {
-        let expect = ScramHash::Sha256.hmac(&token, &msg);
+        let expect = ScramHash::Sha256.hmac(&token.secret, &msg);
         if bool::from(expect.ct_eq(given)) {
+            if token.newest {
+                tokens.used(ctx.host, &user, &token.secret).await;
+            }
             let mut resp = b"Responder".to_vec();
             resp.extend_from_slice(cb);
-            return Step::Success { user, data: Some(ScramHash::Sha256.hmac(&token, &resp)) };
+            return Step::Success { user, data: Some(ScramHash::Sha256.hmac(&token.secret, &resp)) };
         }
     }
-    Step::Failure(Failure::NotAuthorized, None)
+    // XEP-0484 §4.2: a token we don't (or no longer) trust; the client falls back to its password.
+    Step::Failure(Failure::CredentialsExpired, None)
 }
 
 /// The localpart of an authcid: a bare username, or `user@host` for this host.

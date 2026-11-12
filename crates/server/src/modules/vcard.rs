@@ -79,7 +79,15 @@ impl Module for VCard {
             IqType::Get => {
                 let u = owner.clone();
                 let v = cx.srv.db.read(move |c| load(c, &h, &u)).await.map_err(|_| StanzaError::internal())?;
-                ok(v.unwrap_or_else(|| Element::new("vCard", ns::VCARD)))
+                match v {
+                    Some(v) => ok(v),
+                    // The owner may get an empty one to fill in (§3.1). Anyone else gets the
+                    // error a missing account gets, so vCards don't tell who exists (§3.3).
+                    None if cx.local_sender().and_then(|j| j.node().map(str::to_string)).as_deref() == Some(owner.as_str()) => {
+                        ok(Element::new("vCard", ns::VCARD))
+                    }
+                    None => Err(StanzaError::service_unavailable()),
+                }
             }
             IqType::Set => {
                 if cx.local_sender().and_then(|j| j.node().map(str::to_string)).as_deref() != Some(owner.as_str()) {
