@@ -133,6 +133,7 @@ pub struct SessionHandle {
     queue: Arc<Queue>,
     pub presence: Mutex<Presence>,
     pub flags: Mutex<Flags>,
+    pub sm: Arc<crate::c2s::session::SmMirror>,
 }
 
 impl std::fmt::Debug for SessionHandle {
@@ -152,6 +153,7 @@ impl SessionHandle {
             queue,
             presence: Mutex::new(Presence::default()),
             flags: Mutex::new(Flags::default()),
+            sm: Arc::default(),
         }
     }
 

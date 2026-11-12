@@ -370,13 +370,18 @@ impl Negotiation {
 
     async fn open(&mut self, t: &mut dyn Transport, attrs: &[(String, String)], default_ns: &str) -> NegResult<()> {
         let id = quark_core::new_id();
-        let to = StreamEvent::open_attr(attrs, "to").map(str::to_ascii_lowercase);
+        // Domains are prepared like any JID's (case, trailing dot, IDNA): RFC 7622 §3.2.
+        let to = StreamEvent::open_attr(attrs, "to")
+            .map(|t| Jid::domain_jid(t).map_or_else(|_| t.to_ascii_lowercase(), |j| j.domain().to_string()));
         let fallback = self.srv.hosts().first().map(|h| h.domain.clone()).unwrap_or_default();
         let from = to.clone().unwrap_or_else(|| fallback.clone());
-        // Answer with our header before any error, as RFC 6120 §4.9.1.2 requires.
-        let _ = t.open(&from, &id, None).await;
+        // Our header goes `to` the client's bare JID when it named one (RFC 6120 §4.7.2), and
+        // before any error (§4.9.1.2).
+        let client = StreamEvent::open_attr(attrs, "from").and_then(|f| Jid::parse(f).ok()).filter(|j| j.node().is_some());
+        let _ = t.open(&from, &id, client.map(|j| j.to_bare().to_string()).as_deref()).await;
         self.header_sent = true;
-        if default_ns != ns::CLIENT && t.kind() == "tcp" {
+        // Prefixed headers may leave the default namespace undeclared (RFC 6120 §4.8.2).
+        if !matches!(default_ns, ns::CLIENT | "" | ns::STREAM) && t.kind() == "tcp" {
             return Err(Some(StreamError::new("invalid-namespace")));
         }
         let Some(to) = to else { return Err(Some(StreamError::new("host-unknown"))) };
@@ -727,7 +732,17 @@ impl Negotiation {
             return Err(failed("bad-request"));
         };
         match self.srv.sessions.by_smid(previd) {
-            Some(s) if s.jid.domain() == host.domain && s.jid.node() == Some(user) => Ok((s, h)),
+            Some(s) if s.jid.domain() == host.domain && s.jid.node() == Some(user) => {
+                if s.sm.accepts(h) {
+                    return Ok((s, h));
+                }
+                // Refused here, before the connection is handed over, so the client can still
+                // bind (XEP-0198 §5); the old session ends now and its messages go elsewhere.
+                s.close("undefined-condition", Some("A resume claimed more than was sent.".into()));
+                Err(failed("unexpected-request")
+                    .attr_set("h", s.sm.in_h().to_string())
+                    .child(Element::new("handled-count-too-high", ns::SM).attr_set("h", h.to_string())))
+            }
             _ => Err(failed("item-not-found")),
         }
     }

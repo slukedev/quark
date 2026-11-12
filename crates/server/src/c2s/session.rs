@@ -3,7 +3,7 @@
 //! small bounded channel, so a client sending faster than we process is slowed at the socket.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -87,11 +87,48 @@ struct Sm {
     since_request: u32,
     /// We asked (`<r/>`) and the client hasn't answered yet: one question at a time.
     request_pending: bool,
+    /// The counters as other tasks see them, to check a resume before taking the connection.
+    mirror: Arc<SmMirror>,
+}
+
+/// What a resume needs to know about a session's stream management, readable from anywhere.
+#[derive(Debug, Default)]
+pub struct SmMirror {
+    /// Stanzas the client confirmed (high half) and stanzas sent (low half).
+    window: AtomicU64,
+    in_h: AtomicU32,
+}
+
+impl SmMirror {
+    /// Whether a resume claiming `h` is possible: no more than was sent (XEP-0198 §5). An `h`
+    /// behind an earlier ack is stale, not wrong.
+    pub fn accepts(&self, h: u32) -> bool {
+        let w = self.window.load(Ordering::Acquire);
+        let (acked, sent) = ((w >> 32) as u32, w as u32);
+        let newly = h.wrapping_sub(acked);
+        newly > u32::MAX / 2 || newly <= sent.wrapping_sub(acked)
+    }
+
+    pub fn in_h(&self) -> u32 {
+        self.in_h.load(Ordering::Acquire)
+    }
 }
 
 impl Sm {
-    fn new(id: Option<String>) -> Self {
-        Sm { id, in_h: 0, out_h: 0, unacked: VecDeque::new(), unacked_bytes: 0, since_request: 0, request_pending: false }
+    fn new(id: Option<String>, mirror: Arc<SmMirror>) -> Self {
+        mirror.window.store(0, Ordering::Release);
+        mirror.in_h.store(0, Ordering::Release);
+        Sm { id, in_h: 0, out_h: 0, unacked: VecDeque::new(), unacked_bytes: 0, since_request: 0, request_pending: false, mirror }
+    }
+
+    fn publish(&self) {
+        let acked = self.out_h.wrapping_sub(self.unacked.len() as u32);
+        self.mirror.window.store(u64::from(acked) << 32 | u64::from(self.out_h), Ordering::Release);
+    }
+
+    fn received(&mut self) {
+        self.in_h = self.in_h.wrapping_add(1);
+        self.mirror.in_h.store(self.in_h, Ordering::Release);
     }
 
     /// Drops what the client confirmed. False when `h` is impossible (acks more than we sent).
@@ -99,12 +136,17 @@ impl Sm {
         let pending = self.unacked.len() as u32;
         let acked_before = self.out_h.wrapping_sub(pending);
         let newly = h.wrapping_sub(acked_before);
+        // Behind what was already confirmed (a stale or repeated ack): nothing new, not an error.
+        if newly > u32::MAX / 2 {
+            return true;
+        }
         if newly > pending {
             return false;
         }
         for (_, size) in self.unacked.drain(..newly as usize) {
             self.unacked_bytes = self.unacked_bytes.saturating_sub(size);
         }
+        self.publish();
         true
     }
 
@@ -114,6 +156,7 @@ impl Sm {
         self.out_h = self.out_h.wrapping_add(1);
         self.unacked.push_back((el, size));
         self.unacked_bytes += size;
+        self.publish();
         self.since_request += 1;
         self.request_due()
     }
@@ -266,7 +309,7 @@ fn enable_sm(srv: &Arc<Server>, handle: &Arc<SessionHandle>, resume: bool) -> Sm
         drop(f);
         srv.sessions.register_smid(id, handle.clone());
     }
-    Sm::new(id)
+    Sm::new(id, handle.sm.clone())
 }
 
 /// Reads stanzas and passes them on, holding a client to `rate` bytes per second on average
@@ -543,7 +586,7 @@ impl Actor {
             }
             (ns::CLIENT, "iq" | "message" | "presence") => {
                 if let Some(sm) = self.sm.as_mut() {
-                    sm.in_h = sm.in_h.wrapping_add(1);
+                    sm.received();
                 }
                 self.srv.count_in();
                 crate::router::from_client(&self.srv, &self.host, &self.handle, el).await;
@@ -828,7 +871,7 @@ mod tests {
 
     #[test]
     fn ack_drops_confirmed_stanzas() {
-        let mut sm = Sm::new(None);
+        let mut sm = Sm::new(None, Default::default());
         for _ in 0..5 {
             sm.sent(msg(), 10);
         }
@@ -845,7 +888,7 @@ mod tests {
 
     #[test]
     fn ack_handles_wraparound() {
-        let mut sm = Sm::new(None);
+        let mut sm = Sm::new(None, Default::default());
         sm.out_h = u32::MAX - 1;
         for _ in 0..3 {
             sm.sent(msg(), 1);
@@ -856,7 +899,7 @@ mod tests {
 
     #[test]
     fn acks_are_asked_for_one_at_a_time() {
-        let mut sm = Sm::new(None);
+        let mut sm = Sm::new(None, Default::default());
         let asks: Vec<bool> = (0..20).map(|_| sm.sent(msg(), 1)).collect();
         assert_eq!(asks.iter().filter(|a| **a).count(), 1, "one question while it's unanswered: {asks:?}");
         assert!(asks[ACK_EVERY as usize - 1]);

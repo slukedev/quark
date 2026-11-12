@@ -439,6 +439,7 @@ pub fn escape_text(out: &mut String, t: &str) {
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
             '&' => out.push_str("&amp;"),
+            '\r' => out.push_str("&#13;"),
             c if !xml_char(c) => out.push('\u{FFFD}'),
             c => out.push(c),
         }
@@ -846,6 +847,12 @@ impl<R: AsyncRead + Unpin> StreamReader<R> {
                     let default_ns = resolved_ns(&dres);
                     self.opened = true;
                     return Ok(Some(StreamEvent::Open { attrs, default_ns }));
+                }
+                // A second header inside an open stream would swallow every later stanza.
+                Event::Start(e)
+                    if self.stack.is_empty() && e.local_name().as_ref() == "stream" && matches!(&res, Ok(n) if n == ns::STREAM) =>
+                {
+                    return Err(XmlError::Malformed("a stream header inside the stream".into()));
                 }
                 Event::Start(e) => {
                     let mut el = start_element(self.reader.resolver(), res, &e)?;

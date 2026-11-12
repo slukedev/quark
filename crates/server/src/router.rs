@@ -17,8 +17,21 @@ pub async fn from_client(srv: &Arc<Server>, host: &Arc<Host>, session: &Arc<Sess
     el.set_attr("from", session.jid.to_string());
     let to = match quark_core::stanza::jid_attr(&el, "to") {
         Ok(t) => t,
-        Err(e) => return bounce(srv, &el, e).await,
+        // The reply can't come "from" an address that doesn't parse (RFC 6120 §8.3.3.8).
+        Err(e) => {
+            if let Some(mut r) = error_reply(&el, &e) {
+                r.remove_attr("from");
+                session.send(r);
+            }
+            return;
+        }
     };
+    if el.name() == "iq" && el.attr("id").is_none_or(str::is_empty) && matches!(el.attr("type"), Some("get" | "set")) {
+        let mut r = Element::new("iq", ns::CLIENT).attr_set("type", "error").attr_set("id", "");
+        r.append(StanzaError::new(Condition::BadRequest).with_text("An IQ needs an id.").to_element());
+        session.send(r);
+        return;
+    }
     let me = &session.jid;
     let to = match to {
         Some(t) => t,
