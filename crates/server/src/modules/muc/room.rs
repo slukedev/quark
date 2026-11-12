@@ -1549,9 +1549,10 @@ impl Room {
             let want = Affiliation::parse(a)
                 .filter(|a| *a != Affiliation::None)
                 .ok_or_else(|| err(Condition::BadRequest, "That isn't an affiliation."))?;
-            // Members may see who's in a non-anonymous room (OMEMO clients need the list).
-            let ok =
-                aff >= Affiliation::Admin || (want != Affiliation::Outcast && aff >= Affiliation::Member && self.config.non_anonymous());
+            // In a non-anonymous room everyone already sees JIDs, so members and occupants may read
+            // the lists (OMEMO clients need them; Converse asks on every join). Bans stay private.
+            let insider = aff >= Affiliation::Member || role != Role::None;
+            let ok = aff >= Affiliation::Admin || (want != Affiliation::Outcast && insider && self.config.non_anonymous());
             if !ok {
                 return Err(err(Condition::Forbidden, "Only admins and owners can see that list."));
             }

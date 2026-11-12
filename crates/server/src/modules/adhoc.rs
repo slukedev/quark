@@ -77,6 +77,18 @@ impl Module for AdHoc {
         &[(ns::COMMANDS, IqTarget::Server)]
     }
 
+    /// XEP-0050 §2.2 on an account: its own devices see the server's commands (each item names
+    /// the domain, where they run); anyone else gets an empty list.
+    async fn account_node(&self, cx: &IqCtx<'_>, node: &str) -> Option<Vec<Element>> {
+        if node != ns::COMMANDS {
+            return None;
+        }
+        if cx.payload.ns() == ns::DISCO_INFO || cx.from.to_bare() == cx.to.to_bare() {
+            return self.server_node(cx, node).await;
+        }
+        Some(Vec::new())
+    }
+
     async fn server_node(&self, cx: &IqCtx<'_>, node: &str) -> Option<Vec<Element>> {
         let info = cx.payload.ns() == ns::DISCO_INFO;
         if node == ns::COMMANDS {

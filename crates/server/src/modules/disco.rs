@@ -50,7 +50,10 @@ impl Module for Disco {
                     return ok(Element::new("query", cx.payload.ns()).attr_set("node", n).children_from(children));
                 }
             }
-            // XEP-0030 §3.1: a node nobody knows.
+            // XEP-0030 §3.1: a node nobody knows; §8: but a stranger learns nothing about the account.
+            if !server && !super::presence::may_see(cx.srv, cx.host, cx.to.node().unwrap_or_default(), cx.from).await {
+                return Err(StanzaError::service_unavailable());
+            }
             return Err(StanzaError::item_not_found());
         }
         if cx.payload.ns() == ns::DISCO_INFO {

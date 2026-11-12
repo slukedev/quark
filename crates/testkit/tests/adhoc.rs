@@ -197,3 +197,19 @@ async fn failed_admin_commands_are_errors_and_admins_choose_any_password() -> an
     assert_eq!(r.attr("type"), Some("error"), "{r}");
     Ok(())
 }
+
+#[tokio::test]
+async fn an_account_lists_the_servers_commands_to_itself_and_nothing_to_others() -> anyhow::Result<()> {
+    // Smack looks for admin commands on the admin's own bare JID; the items name the domain,
+    // where XEP-0133 commands run.
+    let s = TestServer::start().await?;
+    s.add_user("sam", "password-1").await?;
+    s.add_admin("kim", "password-2").await?;
+    let mut kim = s.login("kim", "password-2").await?;
+    let mut sam = s.login("sam", "password-1").await?;
+    let own = command_nodes(&mut kim, "kim@quark.test").await?;
+    assert!(own.iter().any(|n| n.starts_with(ADMIN)), "{own:?}");
+    assert_eq!(own, command_nodes(&mut kim, s.domain()).await?);
+    assert!(command_nodes(&mut sam, "kim@quark.test").await?.is_empty());
+    Ok(())
+}

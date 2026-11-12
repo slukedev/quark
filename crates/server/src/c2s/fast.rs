@@ -68,11 +68,19 @@ impl FastTokens {
         Ok((token, expires))
     }
 
-    /// Forgets a device's tokens (`<fast invalidate='true'/>`).
-    pub async fn revoke(&self, host: &str, user: &str, agent: &str) -> Result<(), crate::db::DbError> {
-        let (h, u, a) = (host.to_string(), user.to_string(), agent.to_string());
+    /// Forgets the token a device just signed in with (`<fast invalidate='true'/>`), whichever
+    /// slot it's in.
+    pub async fn revoke(&self, host: &str, user: &str, agent: &str, secret: &[u8]) -> Result<(), crate::db::DbError> {
+        let (h, u, a, t) = (host.to_string(), user.to_string(), agent.to_string(), secret.to_vec());
         self.db
-            .write(move |tx| tx.execute("DELETE FROM fast_tokens WHERE host = ?1 AND user = ?2 AND agent = ?3", params![h, u, a]))
+            .write(move |tx| {
+                tx.execute(
+                    "UPDATE fast_tokens SET previous = NULL, previous_expires = NULL, previous_mechanism = NULL
+                     WHERE host = ?1 AND user = ?2 AND agent = ?3 AND previous = ?4",
+                    params![h, u, a, t],
+                )?;
+                tx.execute("DELETE FROM fast_tokens WHERE host = ?1 AND user = ?2 AND agent = ?3 AND token = ?4", params![h, u, a, t])
+            })
             .await
             .map(|_| ())
     }
@@ -187,5 +195,18 @@ mod tests {
         s.issue("a.test", "sam", "phone", "HT-SHA-256-NONE").await.unwrap();
         s.revoke_all("a.test", "sam").await.unwrap();
         assert!(s.tokens("a.test", "sam", "HT-SHA-256-NONE").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalidating_the_token_in_use_keeps_the_newer_one() {
+        // XEP-0484 §3.6: only the token that signed in stops working.
+        let s = store().await;
+        let (t1, _) = s.issue("a.test", "sam", "phone", "HT-SHA-256-NONE").await.unwrap();
+        s.used("a.test", "sam", t1.as_bytes()).await;
+        let (t2, _) = s.issue("a.test", "sam", "phone", "HT-SHA-256-NONE").await.unwrap();
+        s.revoke("a.test", "sam", "phone", t1.as_bytes()).await.unwrap();
+        assert_eq!(valid(&s).await, vec![t2.clone().into_bytes()]);
+        s.revoke("a.test", "sam", "phone", t2.as_bytes()).await.unwrap();
+        assert!(valid(&s).await.is_empty());
     }
 }

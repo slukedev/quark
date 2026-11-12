@@ -221,10 +221,15 @@ async fn disco_on_a_pep_node_describes_the_node() -> anyhow::Result<()> {
     }
     assert_eq!(names(&alice.iq_get(Some(&jid("alice")), disco_items(DEVICES)).await?), ["current"]);
 
-    // No such node, or one the asker may not see (presence access, no subscription).
-    for (c, node) in [(&mut alice, "no-such-node"), (&mut bob, "no-such-node"), (&mut eve, NICK)] {
-        assert_eq!(error_of(&c.iq_get(Some(&jid("alice")), info(node)).await?).0, "item-not-found", "info {node}");
-        assert_eq!(error_of(&c.iq_get(Some(&jid("alice")), disco_items(node)).await?).0, "item-not-found", "items {node}");
+    // No such node, or one the asker may not see (presence access, no subscription). Someone
+    // who can't see alice's presence learns nothing at all (XEP-0030 §8).
+    for (c, node, cond) in [
+        (&mut alice, "no-such-node", "item-not-found"),
+        (&mut bob, "no-such-node", "item-not-found"),
+        (&mut eve, NICK, "service-unavailable"),
+    ] {
+        assert_eq!(error_of(&c.iq_get(Some(&jid("alice")), info(node)).await?).0, cond, "info {node}");
+        assert_eq!(error_of(&c.iq_get(Some(&jid("alice")), disco_items(node)).await?).0, cond, "items {node}");
     }
 
     // Without a node it's still the account.

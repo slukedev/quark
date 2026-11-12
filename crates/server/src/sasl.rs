@@ -82,6 +82,8 @@ pub enum Step {
     Success {
         user: String,
         data: Option<Vec<u8>>,
+        /// The FAST token that signed in, if one did (for `invalidate`).
+        token: Option<Vec<u8>>,
     },
     Failure(Failure, Option<&'static str>),
     /// Refused before any secret was checked (a channel binding we can't do): the client may
@@ -262,7 +264,7 @@ impl Sasl {
                     return Step::Failure(Failure::AccountDisabled, None);
                 }
                 let server_sig = hash.hmac(&cred.server_key, auth_message.as_bytes());
-                Step::Success { user, data: Some(format!("v={}", B64.encode(server_sig)).into_bytes()) }
+                Step::Success { user, data: Some(format!("v={}", B64.encode(server_sig)).into_bytes()), token: None }
             }
             State::Done => Step::Failure(Failure::MalformedRequest, None),
         }
@@ -287,7 +289,7 @@ async fn plain(ctx: &Context<'_>, initial: &[u8]) -> Step {
     // The password first: saying "disabled" to anyone would tell them the account exists (and
     // is disabled) without knowing its password. SCRAM checks the proof first the same way.
     match ctx.accounts.password_state(ctx.host, &user, pass).await {
-        Ok(Some(true)) => Step::Success { user, data: None },
+        Ok(Some(true)) => Step::Success { user, data: None, token: None },
         Ok(Some(false)) => Step::Failure(Failure::AccountDisabled, None),
         Ok(None) => Step::Failure(Failure::NotAuthorized, None),
         Err(_) => Step::Failure(Failure::TemporaryAuthFailure, None),
@@ -331,7 +333,7 @@ async fn fast(ctx: &Context<'_>, mechanism: &str, initial: &[u8]) -> Step {
             }
             let mut resp = b"Responder".to_vec();
             resp.extend_from_slice(cb);
-            return Step::Success { user, data: Some(ScramHash::Sha256.hmac(&token.secret, &resp)) };
+            return Step::Success { user, data: Some(ScramHash::Sha256.hmac(&token.secret, &resp)), token: Some(token.secret) };
         }
     }
     // XEP-0484 §4.2: a token we don't (or no longer) trust; the client falls back to its password.
@@ -473,7 +475,7 @@ mod tests {
         let sf = String::from_utf8(sf).unwrap();
         let (fin, server_sig) = client_final(ScramHash::Sha256, "pencil-pencil", bare, &sf, b"n,,");
         match s.unwrap().step(&c, fin.as_bytes()).await {
-            Step::Success { user, data } => {
+            Step::Success { user, data, .. } => {
                 assert_eq!(user, "user");
                 assert_eq!(data.unwrap(), format!("v={}", B64.encode(server_sig)).into_bytes());
             }

@@ -1196,3 +1196,22 @@ async fn own_lines_stay_in_the_room_archive_and_chat_states_never_crowd_out_mess
     assert_eq!(room_archive(&mut alice, "tea").await?.len(), 1);
     Ok(())
 }
+
+#[tokio::test]
+async fn occupants_of_a_non_anonymous_room_may_read_its_lists() -> anyhow::Result<()> {
+    let s = TestServer::start().await?;
+    let mut alice = person(&s, "alice").await?;
+    let mut bob = person(&s, "bob").await?;
+    make_room(&mut alice, "tea", "alice").await?;
+    join(&mut bob, &occ("tea", "bob")).await?;
+    // Semi-anonymous: the owner's address isn't bob's to see.
+    let r = bob.iq_get(Some(&room("tea")), admin_item(&[("affiliation", "owner")])).await?;
+    assert_eq!(error_condition(&r).as_deref(), Some("forbidden"), "{r}");
+    configure(&mut alice, "tea", &[("muc#roomconfig_whois", "anyone")]).await?;
+    let r = bob.iq_get(Some(&room("tea")), admin_item(&[("affiliation", "owner")])).await?;
+    let q = r.get_child("query", MUC_ADMIN).expect("a list");
+    assert_eq!(q.children().filter_map(|i| i.attr("jid")).collect::<Vec<_>>(), vec!["alice@quark.test"]);
+    let r = bob.iq_get(Some(&room("tea")), admin_item(&[("affiliation", "outcast")])).await?;
+    assert_eq!(error_condition(&r).as_deref(), Some("forbidden"), "bans stay private: {r}");
+    Ok(())
+}

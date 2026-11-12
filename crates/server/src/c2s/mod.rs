@@ -692,7 +692,7 @@ impl Negotiation {
                 }
                 Ok(None)
             }
-            Step::Success { user, data } => {
+            Step::Success { user, data, token } => {
                 self.sasl = None;
                 self.user = Some(user.clone());
                 if !v2 {
@@ -701,7 +701,7 @@ impl Negotiation {
                     t.restart();
                     return Ok(None);
                 }
-                self.sasl2_success(t, host, &user, data).await
+                self.sasl2_success(t, host, &user, data, token).await
             }
         }
     }
@@ -713,6 +713,7 @@ impl Negotiation {
         host: &Arc<Host>,
         user: &str,
         data: Option<Vec<u8>>,
+        used_token: Option<Vec<u8>>,
     ) -> NegResult<Option<Outcome>> {
         let inline = self.sasl2.take().unwrap_or_default();
         let bare = Jid::bare_unchecked(user, &host.domain);
@@ -721,8 +722,9 @@ impl Negotiation {
             success.append(Element::new("additional-data", ns::SASL2).text(B64.encode(d)));
         }
         if let Some(agent) = &inline.agent_id {
-            if inline.fast_invalidate {
-                let _ = self.srv.fast_tokens.revoke(&host.domain, user, agent).await;
+            // XEP-0484 §3.6: only the token used; a newer one the device holds stays good.
+            if let Some(used) = used_token.filter(|_| inline.fast_invalidate) {
+                let _ = self.srv.fast_tokens.revoke(&host.domain, user, agent, &used).await;
             }
             if let Some(mech) = inline.request_token.as_deref() {
                 if let Ok((token, expiry)) = self.srv.fast_tokens.issue(&host.domain, user, agent, mech).await {

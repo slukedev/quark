@@ -407,3 +407,13 @@ async fn disco_items_on_a_missing_account_is_empty() -> anyhow::Result<()> {
     assert_error(&r, &["service-unavailable"]);
     Ok(())
 }
+
+#[tokio::test]
+async fn a_stranger_asking_about_an_unknown_node_learns_nothing() -> anyhow::Result<()> {
+    // XEP-0030 §8: service-unavailable to someone who can't see the account's presence.
+    let s = server(&["alice", "bob"]).await?;
+    let mut a = s.online("alice", PW, "phone").await?;
+    let r = a.iq_get(Some(&bare("bob")), Element::new("query", ns::DISCO_INFO).attr_set("node", "no-such-node")).await?;
+    assert_error(&r, &["service-unavailable"]);
+    Ok(())
+}
