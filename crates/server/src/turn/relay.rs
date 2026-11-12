@@ -573,8 +573,10 @@ impl Relay {
     }
 
     /// Lists the machine's addresses again (interfaces come and go: DHCP, VPNs, containers).
+    /// Loopback and the configured addresses are guarded even when the system won't list them.
     pub fn refresh_own_addrs(&self) {
-        let Some(mut ips) = interface_addrs() else { return };
+        let mut ips = interface_addrs().unwrap_or_default();
+        ips.extend([IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)]);
         if !self.bind_ip.is_unspecified() {
             ips.push(self.bind_ip);
         }
