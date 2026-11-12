@@ -334,6 +334,9 @@ impl Transport for TcpTransport {
             Io::Plain(tcp) => tcp,
             Io::Tls(_) => return Err(io::Error::other("already encrypted")),
         };
+        // Some clients (go-xmpp) end <starttls/> with a newline, against RFC 6120 §5.3.3; it can
+        // also arrive after we've read. A TLS ClientHello never starts with whitespace.
+        skip_whitespace(&tcp).await?;
         let tls = tokio_rustls::TlsAcceptor::from(cfg).accept(tcp).await?;
         let (sni, _, cb) = crate::tls::session_facts(&tls, &self.certs);
         self.sni = sni;
@@ -450,4 +453,24 @@ impl StanzaWriter for Closed {
         Err(io::Error::new(io::ErrorKind::NotConnected, "stream closed"))
     }
     async fn close(&mut self, _err: Option<&StreamError>) {}
+}
+
+/// Reads away whitespace waiting at the start of the socket, without touching anything else.
+async fn skip_whitespace(tcp: &tokio::net::TcpStream) -> io::Result<()> {
+    let mut buf = [0u8; 64];
+    loop {
+        let n = match tokio::time::timeout(std::time::Duration::from_millis(50), tcp.peek(&mut buf)).await {
+            Ok(r) => r?,
+            Err(_) => return Ok(()),
+        };
+        let ws = buf[..n].iter().take_while(|b| b.is_ascii_whitespace()).count();
+        if ws == 0 {
+            return Ok(());
+        }
+        let mut sink = vec![0u8; ws];
+        match tcp.try_read(&mut sink) {
+            Err(e) if e.kind() != io::ErrorKind::WouldBlock => return Err(e),
+            _ => {}
+        }
+    }
 }

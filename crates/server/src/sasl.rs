@@ -107,10 +107,12 @@ pub struct Context<'a> {
     pub tokens: Option<&'a dyn TokenCheck>,
 }
 
-/// Mechanisms to offer, strongest first.
+/// Mechanisms to offer, strongest first. -PLUS only on TLS 1.3: on older TLS, clients default
+/// to tls-unique (RFC 5929), which we can't do, and our downgrade check would then refuse their
+/// fallback too. Those that know XEP-0440 can still bind with tls-server-end-point.
 pub fn mechanisms(cb: &ChannelBindings, secure: bool) -> Vec<&'static str> {
     let mut m = Vec::new();
-    if cb.any() {
+    if cb.exporter.is_some() {
         m.extend(["SCRAM-SHA-512-PLUS", "SCRAM-SHA-256-PLUS", "SCRAM-SHA-1-PLUS"]);
     }
     m.extend(["SCRAM-SHA-512", "SCRAM-SHA-256", "SCRAM-SHA-1"]);
@@ -174,9 +176,10 @@ impl Sasl {
                 if plus && !ctx.cb.any() {
                     return (None, Step::Refused(Failure::InvalidMechanism));
                 }
-                // RFC 5802 §6: an unsupported channel binding type fails, but it's negotiation.
+                // RFC 5802 §6: a channel binding type we can't do (or none, on -PLUS) fails, but
+                // it's negotiation: the client goes on to another mechanism.
                 let cb_type = initial.strip_prefix(b"p=").and_then(|r| r.split(|b| *b == b',').next());
-                if plus && cb_type.is_some_and(|k| std::str::from_utf8(k).map_or(true, |k| ctx.cb.get(k).is_none())) {
+                if plus && cb_type.is_none_or(|k| std::str::from_utf8(k).map_or(true, |k| ctx.cb.get(k).is_none())) {
                     return (None, Step::Refused(Failure::NotAuthorized));
                 }
                 match scram_first(ctx, hash, plus, initial).await {

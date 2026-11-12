@@ -787,9 +787,9 @@ impl<R: AsyncRead + Unpin> StreamReader<R> {
         self.count.load(Ordering::Relaxed)
     }
 
-    /// Bytes buffered but not yet parsed (STARTTLS injection check).
+    /// Bytes buffered but not yet parsed, other than whitespace (STARTTLS injection check).
     pub fn has_buffered(&self) -> bool {
-        !self.reader.get_ref().buffer().is_empty()
+        !self.reader.get_ref().buffer().iter().all(u8::is_ascii_whitespace)
     }
 
     pub async fn next(&mut self) -> Result<Option<StreamEvent>, XmlError> {

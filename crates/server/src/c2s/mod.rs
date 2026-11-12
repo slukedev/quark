@@ -581,6 +581,8 @@ impl Negotiation {
                 t.send(&f).await.map_err(|_| None)?;
                 Ok(None)
             }
+            // Acks pipelined behind an <enable/> that didn't happen; nothing to count yet.
+            (ns::SM, "r" | "a") => Ok(None),
             (ns::CLIENT, _) => Err(Some(StreamError::new("not-authorized"))),
             _ => Err(Some(StreamError::new("unsupported-stanza-type"))),
         }
@@ -733,7 +735,8 @@ impl Negotiation {
             host: host.clone(),
             jid: full,
             client: self.client.clone(),
-            prelude: vec![success.child(bound)],
+            // XEP-0388 §2.6.1: features follow <success>; bound, there's nothing left to offer.
+            prelude: vec![success.child(bound), Element::new("features", ns::STREAM)],
             carbons,
             inactive,
             sm,

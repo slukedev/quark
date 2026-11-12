@@ -362,8 +362,21 @@ impl Client {
 
     /// Connects with TLS from the first byte (XEP-0368), ALPN `xmpp-client`.
     pub async fn connect_tls(addr: SocketAddr, domain: &str) -> anyhow::Result<Client> {
+        Self::connect_tls_versions(addr, domain, rustls::DEFAULT_VERSIONS).await
+    }
+
+    /// Like `connect_tls`, as a client that only speaks TLS 1.2.
+    pub async fn connect_tls12(addr: SocketAddr, domain: &str) -> anyhow::Result<Client> {
+        Self::connect_tls_versions(addr, domain, &[&rustls::version::TLS12]).await
+    }
+
+    async fn connect_tls_versions(
+        addr: SocketAddr,
+        domain: &str,
+        versions: &[&'static rustls::SupportedProtocolVersion],
+    ) -> anyhow::Result<Client> {
         let tcp = TcpStream::connect(addr).await?;
-        let tls = tls_connect(tcp, domain, &[b"xmpp-client"]).await?;
+        let tls = tls_connect_with(tcp, domain, &[b"xmpp-client"], versions).await?;
         let exporter = exporter(&tls);
         let alpn = tls.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
         let (r, w) = tokio::io::split(Io::Tls(Box::new(tls)));
@@ -402,7 +415,12 @@ impl Client {
 
     /// STARTTLS (accepting the server's certificate, whatever it is), then a new stream.
     pub async fn starttls(&mut self) -> anyhow::Result<()> {
-        self.send(&Element::new("starttls", ns::TLS)).await?;
+        self.starttls_raw(&Element::new("starttls", ns::TLS).to_xml()).await
+    }
+
+    /// STARTTLS with the request written by the test (to add stray whitespace, say).
+    pub async fn starttls_raw(&mut self, request: &str) -> anyhow::Result<()> {
+        self.send_raw(request).await?;
         let r = self.recv().await?;
         if !r.is("proceed", ns::TLS) {
             bail!("STARTTLS refused: {r}");
@@ -666,8 +684,17 @@ impl Client {
 }
 
 async fn tls_connect(tcp: TcpStream, domain: &str, alpn: &[&[u8]]) -> anyhow::Result<tokio_rustls::client::TlsStream<TcpStream>> {
+    tls_connect_with(tcp, domain, alpn, rustls::DEFAULT_VERSIONS).await
+}
+
+async fn tls_connect_with(
+    tcp: TcpStream,
+    domain: &str,
+    alpn: &[&[u8]],
+    versions: &[&'static rustls::SupportedProtocolVersion],
+) -> anyhow::Result<tokio_rustls::client::TlsStream<TcpStream>> {
     let mut cfg = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-        .with_safe_default_protocol_versions()?
+        .with_protocol_versions(versions)?
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(AcceptAny))
         .with_no_client_auth();

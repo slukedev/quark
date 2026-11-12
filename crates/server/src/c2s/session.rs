@@ -394,7 +394,7 @@ impl Actor {
         if let Some(sm) = &self.sm {
             let enabled = sm_enabled(sm, self.resume_secs);
             // Bind2 reports it inside <bound/>; otherwise it follows the prelude.
-            match prelude.last_mut().and_then(|s| s.get_child_mut("bound", ns::BIND2)) {
+            match prelude.iter_mut().find_map(|s| s.get_child_mut("bound", ns::BIND2)) {
                 Some(bound) => bound.append(enabled),
                 None => prelude.push(enabled),
             }
@@ -754,11 +754,11 @@ impl Actor {
         sm.request_pending = false;
         sm.since_request = u32::try_from(replay.len()).unwrap_or(u32::MAX);
         let mut w = TimedWriter::boxed(req.writer, WRITE_TIMEOUT);
-        let first = match req.wrap {
-            Some(success) => success.child(resumed),
-            None => resumed,
+        let ok = match req.wrap {
+            // XEP-0388 §2.6.1: <success> is followed by the new stream's features (none left).
+            Some(success) => w.write(&success.child(resumed)).await.is_ok() && w.write(&Element::new("features", ns::STREAM)).await.is_ok(),
+            None => w.write(&resumed).await.is_ok(),
         };
-        let ok = w.write(&first).await.is_ok();
         for el in &replay {
             if !ok || w.write(el).await.is_err() {
                 break;

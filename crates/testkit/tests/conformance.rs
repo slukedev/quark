@@ -139,3 +139,53 @@ async fn probing_channel_binding_types_is_not_a_failed_sign_in() -> anyhow::Resu
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn a_newline_after_starttls_is_tolerated() -> anyhow::Result<()> {
+    // go-xmpp writes one (against RFC 6120 §5.3.3); whitespace can't be a TLS record.
+    let s = server().await?;
+    for trailer in ["\n", " \r\n"] {
+        let mut c = Client::connect(s.c2s(), DOMAIN).await?;
+        c.starttls_raw(&format!("<starttls xmlns='{}'/>{trailer}", ns::TLS)).await?;
+        c.auth_scram("SCRAM-SHA-256", "alice", "password1").await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn tls_1_2_clients_are_not_offered_plus_mechanisms_they_cannot_use() -> anyhow::Result<()> {
+    // Without tls-exporter, -PLUS clients default to tls-unique, which we can't do; offering it
+    // turned their fallback into a downgrade and locked out libstrophe and mellium.
+    let s = server().await?;
+    let mut c = Client::connect_tls12(s.c2s_tls(), DOMAIN).await?;
+    assert!(!c.mechanisms().iter().any(|m| m.ends_with("-PLUS")), "{:?}", c.mechanisms());
+    let first = b64("y,,n=alice,r=abcdefghijklmnop");
+    c.send(&Element::new("auth", ns::SASL).attr_set("mechanism", "SCRAM-SHA-256").text(first)).await?;
+    let r = c.recv().await?;
+    assert!(r.is("challenge", ns::SASL), "a 'y' flag is no downgrade here: {r}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn sasl2_success_is_followed_by_features() -> anyhow::Result<()> {
+    // XEP-0388 §2.6.1, with Bind2 too: go-xmpp waits for them.
+    let s = server().await?;
+    let mut c = tls_client(&s).await?;
+    let end = sasl2_scram(&mut c, "alice", "password1", vec![user_agent(&agent_id()), bind2("go", vec![])]).await?;
+    assert!(matches!(end, SaslEnd::Success(_)));
+    let f = c.recv().await?;
+    assert!(f.is("features", ns::STREAM), "{f}");
+    assert!(!f.has_child("bind", ns::BIND), "already bound: {f}");
+    let r = c.iq_get(Some(DOMAIN), Element::new("ping", ns::PING)).await?;
+    assert_eq!(r.attr("type"), Some("result"), "{r}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn acks_before_stream_management_is_on_are_ignored() -> anyhow::Result<()> {
+    let s = server().await?;
+    let mut c = authed_client(&s, "alice", "password1").await?;
+    c.send_raw("<r xmlns='urn:xmpp:sm:3'/><a xmlns='urn:xmpp:sm:3' h='0'/>").await?;
+    c.bind(None).await?;
+    Ok(())
+}
