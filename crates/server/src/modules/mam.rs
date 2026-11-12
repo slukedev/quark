@@ -290,8 +290,10 @@ impl Module for Mam {
         let me = cx.from.to_bare();
         let mine = me.to_string();
         strip_stanza_ids(msg, &me);
-        // To one's own account: archived once, on the way in.
-        if cx.to.to_bare() == me || !cx.host.settings().history.on() || !archivable(msg) {
+        // To one's own account: archived once, on the way in. Group chat lines live in the
+        // room's archive, never in the sender's (XEP-0313 §7.4: we don't advertise them).
+        let to_room = msg.attr("type") == Some("groupchat");
+        if to_room || cx.to.to_bare() == me || !cx.host.settings().history.on() || !archivable(msg) {
             return Flow::Continue;
         }
         if !wants(cx.srv, cx.host, &me, cx.to).await {

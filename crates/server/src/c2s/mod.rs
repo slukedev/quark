@@ -631,9 +631,17 @@ impl Negotiation {
                 t.send(&e).await.map_err(|_| None)?;
                 Ok(None)
             }
+            Step::Refused(f) => {
+                self.sasl = None;
+                t.send(&failure_el(ns_, f, None)).await.map_err(|_| None)?;
+                Ok(None)
+            }
             Step::Failure(f, text) => {
                 self.sasl = None;
-                self.srv.auth_limiter.failed(t.peer());
+                // Only a wrong secret is a guess; malformed or aborted attempts aren't.
+                if f == Failure::NotAuthorized {
+                    self.srv.auth_limiter.failed(t.peer());
+                }
                 self.srv.stats.auth_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 t.send(&failure_el(ns_, f, text)).await.map_err(|_| None)?;
                 // RFC 6120 §6.4.5: a few retries, then the stream ends.

@@ -141,11 +141,14 @@ impl Bucket {
         Bucket { tokens: BURST, at: Instant::now() }
     }
     fn take(&mut self) -> bool {
+        self.take_some(1.0)
+    }
+    fn take_some(&mut self, cost: f32) -> bool {
         let now = Instant::now();
         self.tokens = (self.tokens + now.duration_since(self.at).as_secs_f32() * REFILL_PER_SEC).min(BURST);
         self.at = now;
-        if self.tokens >= 1.0 {
-            self.tokens -= 1.0;
+        if self.tokens >= cost {
+            self.tokens -= cost;
             true
         } else {
             false
@@ -360,6 +363,10 @@ pub fn check_role_change(
 pub fn check_affiliation_change(actor_aff: Affiliation, old: Affiliation, new: Affiliation) -> Result<(), StanzaError> {
     if actor_aff < Affiliation::Admin {
         return Err(err(Condition::Forbidden, "Only admins and owners can change who's a member."));
+    }
+    // XEP-0045 §9.1: an admin can't ban an admin or owner.
+    if new == Affiliation::Outcast && old >= Affiliation::Admin && actor_aff < Affiliation::Owner {
+        return Err(err(Condition::NotAllowed, "Only owners can ban an admin or owner."));
     }
     if (new >= Affiliation::Admin || old >= Affiliation::Admin) && actor_aff < Affiliation::Owner {
         return Err(err(Condition::Forbidden, "Only owners can change who's an admin or owner."));
@@ -1085,7 +1092,13 @@ impl Room {
             }
             return Err(err(Condition::Forbidden, "You need a voice to talk in this group chat."));
         }
-        if !o.bucket.take() {
+        // Chat states, markers and reactions cost a quarter and are dropped quietly when over the
+        // limit, so they never crowd out what people read.
+        if !has_body && !is_subject && !msg.has_child("encrypted", ns::OMEMO) {
+            if !o.bucket.take_some(0.25) {
+                return Ok(None);
+            }
+        } else if !o.bucket.take() {
             return Err(err(Condition::ResourceConstraint, "You're sending messages too fast; wait a moment.").with_type(ErrorType::Wait));
         }
         if is_subject && !(change_subject || o.role == Role::Moderator) {
@@ -2220,7 +2233,9 @@ mod tests {
         );
         assert!(check_role_change(A::None, Role::Moderator, A::None, Role::Participant, Role::Moderator).is_err());
         assert!(check_affiliation_change(A::Admin, A::None, A::Outcast).is_ok());
-        assert!(check_affiliation_change(A::Admin, A::Admin, A::Outcast).is_err());
+        // XEP-0045 §9.1: banning an admin or owner is not-allowed for admins.
+        assert_eq!(check_affiliation_change(A::Admin, A::Owner, A::Outcast).unwrap_err().condition, Condition::NotAllowed);
+        assert_eq!(check_affiliation_change(A::Admin, A::Member, A::Admin).unwrap_err().condition, Condition::Forbidden);
         assert!(check_affiliation_change(A::Admin, A::None, A::Admin).is_err());
         assert!(check_affiliation_change(A::Owner, A::None, A::Owner).is_ok());
         assert!(check_affiliation_change(A::Member, A::None, A::Member).is_err());

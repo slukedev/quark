@@ -1087,3 +1087,32 @@ async fn the_public_listing_follows_rooms_as_they_change() -> anyhow::Result<()>
     assert!(!listed(&items).contains(&room("club")), "{items}");
     Ok(())
 }
+
+#[tokio::test]
+async fn own_lines_stay_in_the_room_archive_and_chat_states_never_crowd_out_messages() -> anyhow::Result<()> {
+    let s = TestServer::start().await?;
+    let mut alice = person(&s, "alice").await?;
+    let mut bob = person(&s, "bob").await?;
+    make_room(&mut alice, "tea", "alice").await?;
+    join(&mut bob, &occ("tea", "bob")).await?;
+
+    // A burst of chat states and markers, then something people read.
+    for _ in 0..60 {
+        let state = Element::new("message", ns::CLIENT)
+            .attr_set("to", room("tea"))
+            .attr_set("type", "groupchat")
+            .child(Element::new("composing", "http://jabber.org/protocol/chatstates"));
+        alice.send(&state).await?;
+    }
+    alice.send(&groupchat("tea", "hello")).await?;
+    expect_body(&mut bob, &occ("tea", "alice"), "hello").await?;
+    alice.expect(|e| e.child_text("body", ns::CLIENT).as_deref() == Some("hello")).await?;
+
+    // The account's own archive has none of it (XEP-0313 §7.4: groupchat isn't advertised).
+    let r = alice.iq_set(None, Element::new("query", ns::MAM)).await?;
+    assert_eq!(r.attr("type"), Some("result"), "{r}");
+    let count = r.get_child("fin", ns::MAM).and_then(|f| f.get_child("set", ns::RSM)).and_then(|s| s.child_text("count", ns::RSM));
+    assert_eq!(count.as_deref(), Some("0"), "{r}");
+    assert_eq!(room_archive(&mut alice, "tea").await?.len(), 1);
+    Ok(())
+}

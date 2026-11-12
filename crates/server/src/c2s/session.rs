@@ -795,7 +795,8 @@ impl Actor {
         let unacked = self.sm.take().map(|s| s.unacked).unwrap_or_default();
         let held = std::mem::take(&mut self.csi);
         for (el, _) in unacked.into_iter().chain(held) {
-            if el.name() == "message" && el.has_child("body", ns::CLIENT) && matches!(el.attr("type"), None | Some("chat" | "normal")) {
+            // Anything offline storage would keep: bodies, but also OMEMO without a fallback body.
+            if el.name() == "message" && crate::modules::offline::storable(&el) {
                 crate::router::redeliver(&self.srv, &self.host, &self.handle.jid, el).await;
             }
         }

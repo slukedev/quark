@@ -84,6 +84,9 @@ pub enum Step {
         data: Option<Vec<u8>>,
     },
     Failure(Failure, Option<&'static str>),
+    /// Refused before any secret was checked (a channel binding we can't do): the client may
+    /// try another mechanism, and it isn't a guess at a password.
+    Refused(Failure),
 }
 
 /// Something that can check FAST tokens (XEP-0484); implemented by the FAST store.
@@ -169,7 +172,12 @@ impl Sasl {
                     _ => return (None, Step::Failure(Failure::InvalidMechanism, None)),
                 };
                 if plus && !ctx.cb.any() {
-                    return (None, Step::Failure(Failure::InvalidMechanism, None));
+                    return (None, Step::Refused(Failure::InvalidMechanism));
+                }
+                // RFC 5802 §6: an unsupported channel binding type fails, but it's negotiation.
+                let cb_type = initial.strip_prefix(b"p=").and_then(|r| r.split(|b| *b == b',').next());
+                if plus && cb_type.is_some_and(|k| std::str::from_utf8(k).map_or(true, |k| ctx.cb.get(k).is_none())) {
+                    return (None, Step::Refused(Failure::NotAuthorized));
                 }
                 match scram_first(ctx, hash, plus, initial).await {
                     Ok((state, challenge)) => (Some(Sasl { state }), Step::Challenge(challenge)),

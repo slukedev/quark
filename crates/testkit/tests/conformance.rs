@@ -121,3 +121,21 @@ async fn a_resume_claiming_too_much_fails_softly_and_the_client_can_bind() -> an
     c.expect_silence(Duration::from_millis(200)).await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn probing_channel_binding_types_is_not_a_failed_sign_in() -> anyhow::Result<()> {
+    let s = server().await?;
+    // Clients without tls-exporter try tls-unique on every -PLUS mechanism before falling back.
+    // Ten of those a minute used to lock the address out, correct passwords and all.
+    for _ in 0..6 {
+        let mut c = tls_client(&s).await?;
+        for m in ["SCRAM-SHA-512-PLUS", "SCRAM-SHA-256-PLUS", "SCRAM-SHA-1-PLUS"] {
+            let first = b64("p=tls-unique,,n=alice,r=abcdefghijklmnop");
+            c.send(&Element::new("auth", ns::SASL).attr_set("mechanism", m).text(first)).await?;
+            let f = c.expect(|e| e.ns() == ns::SASL).await?;
+            assert_eq!(sasl_failure_condition(&f).as_deref(), Some("not-authorized"), "{f}");
+        }
+        c.auth_scram("SCRAM-SHA-256", "alice", "password1").await?;
+    }
+    Ok(())
+}
