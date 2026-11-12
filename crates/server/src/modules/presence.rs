@@ -123,13 +123,13 @@ pub async fn from_client_broadcast(srv: &Arc<Server>, host: &Arc<Host>, session:
             if super::blocking::is_blocked(srv, &bare, &it.contact).await {
                 continue;
             }
-            let p = it
+            // Addressed to the bare JID, as it was sent (RFC 6121 §8.5.2.1.2).
+            let mut p = it
                 .pending_in
                 .as_deref()
                 .and_then(|x| Element::parse(x).ok())
                 .unwrap_or_else(|| presence(&it.contact, &bare, Some("subscribe")));
-            let mut p = p;
-            p.set_attr("to", me.to_string());
+            p.set_attr("to", bare.to_string());
             session.send(p);
         }
     }
@@ -325,13 +325,28 @@ async fn outbound_subscription(
 /// Subscription requests kept per account until answered. Beyond this new ones are dropped
 /// (people answer or ignore requests long before; a flood from one server stops here).
 pub const MAX_PENDING: usize = 500;
-/// Longest status text and nickname kept with a stored request, in bytes.
+/// Largest subscription request kept whole, in bytes of XML. Bigger ones keep only what a person
+/// reads (anyone can ask, and what's asked sits on our disk until answered).
+const MAX_STORED_REQUEST: usize = 4096;
+/// Longest status text and nickname kept from a request too big to keep whole, in bytes.
 const MAX_STORED_TEXT: usize = 1024;
 
-/// What's stored of a subscription request: who, and the status text and nickname (XEP-0172)
-/// a person reads, cut to size. The rest of the stanza (anything a sender wants to park on our
-/// disk) is dropped.
+/// What's stored of a subscription request to replay at sign-in: the complete stanza with its
+/// id and extensions (RFC 6121 §3.1.3), without `to` (set on delivery) and archive ids claiming
+/// to be ours (XEP-0359 §5). Over [`MAX_STORED_REQUEST`], only who asked and the status text and
+/// nickname (XEP-0172), cut to size.
 fn stored_request(el: &Element) -> Element {
+    let mut p = el.clone();
+    p.remove_attr("to");
+    p.set_attr("type", "subscribe");
+    let sender = el.attr("from").and_then(|f| Jid::parse(f).ok());
+    p.remove_children(|c| {
+        c.is("stanza-id", ns::SID)
+            && !c.attr("by").and_then(|b| Jid::parse(b).ok()).zip(sender.as_ref()).is_some_and(|(b, s)| b.domain() == s.domain())
+    });
+    if p.to_xml().len() <= MAX_STORED_REQUEST {
+        return p;
+    }
     let mut p = Element::new("presence", ns::CLIENT).attr_opt("from", el.attr("from")).attr_set("type", "subscribe");
     for (name, child_ns) in [("status", ns::CLIENT), ("nick", ns::NICK)] {
         if let Some(t) = el.child_text(name, child_ns) {
@@ -359,20 +374,34 @@ pub async fn inbound(srv: &Arc<Server>, host: &Arc<Host>, from: &Jid, to: &Jid, 
         }
         Some("probe") => answer_probe(srv, host, user, from).await,
         _ => {
-            // Availability from a contact (or a room): to the device it names, or all devices.
+            // Availability from a contact (or a room): to the device it names, or all devices,
+            // with `to` as it was sent (RFC 6121 §8.5.2.1.2).
             if to.resource().is_some() {
                 if let Some(s) = srv.sessions.get(to) {
                     s.send(el);
                 }
             } else {
                 for s in srv.sessions.available_of(to) {
-                    let mut p = el.clone();
-                    p.set_attr("to", s.jid.to_string());
-                    s.send(p);
+                    s.send(el.clone());
                 }
             }
         }
     }
+}
+
+/// Whether `who` may see the account's presence: the account itself, its own server, someone
+/// it shares presence with (subscription "from" or "both", RFC 6121 §3), or someone one of its
+/// devices sent directed presence to (a group chat it joined). Guards what the server answers
+/// for the account, such as disco#info (XEP-0030 §8).
+pub async fn may_see(srv: &Arc<Server>, host: &Host, user: &str, who: &Jid) -> bool {
+    let me = Jid::bare_unchecked(user, &host.domain);
+    if who.to_bare() == me || who.node().is_none() && who.resource().is_none() && who.domain() == host.domain {
+        return true;
+    }
+    if matches!(roster::item(srv, &host.domain, user, who).await, Ok(Some(it)) if it.subscription.sends_to_contact()) {
+        return true;
+    }
+    srv.sessions.of(&me).iter().any(|s| s.presence.lock().directed.iter().any(|d| d == who || d.to_bare() == who.to_bare()))
 }
 
 async fn answer_probe(srv: &Arc<Server>, host: &Arc<Host>, user: &str, from: &Jid) {
@@ -411,11 +440,10 @@ async fn inbound_subscription(
     let me = Jid::bare_unchecked(user, &host.domain);
     el.set_attr("from", contact.to_string());
     let existing = roster::item(srv, &host.domain, user, contact).await?;
+    // To every device, with `to` as it was sent (RFC 6121 §8.5.2.1.2).
     let deliver = |el: Element| {
         for s in srv.sessions.available_of(&me) {
-            let mut p = el.clone();
-            p.set_attr("to", s.jid.to_string());
-            s.send(p);
+            s.send(el.clone());
         }
     };
     match kind {
@@ -502,7 +530,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stored_requests_keep_only_what_people_read() {
+    fn stored_requests_keep_the_whole_stanza() {
+        let el = Element::new("presence", ns::CLIENT)
+            .attr_set("from", "a@b")
+            .attr_set("to", "c@d")
+            .attr_set("id", "req1")
+            .attr_set("type", "subscribe")
+            .text_child("status", ns::CLIENT, "hi")
+            .child(Element::new("x", "urn:example:ext").attr_set("k", "v"))
+            .child(Element::new("stanza-id", ns::SID).attr_set("by", "d").attr_set("id", "forged"))
+            .child(Element::new("stanza-id", ns::SID).attr_set("by", "b").attr_set("id", "theirs"));
+        let p = stored_request(&el);
+        assert_eq!(p.attr("id"), Some("req1"));
+        assert_eq!(p.attr("from"), Some("a@b"));
+        assert_eq!(p.attr("to"), None);
+        assert_eq!(p.get_child("x", "urn:example:ext").and_then(|x| x.attr("k")), Some("v"));
+        let ids: Vec<_> = p.children().filter(|c| c.is("stanza-id", ns::SID)).filter_map(|c| c.attr("id")).collect();
+        assert_eq!(ids, ["theirs"]);
+    }
+
+    #[test]
+    fn big_stored_requests_keep_only_what_people_read() {
         let long = "\u{e9}".repeat(MAX_STORED_TEXT);
         let el = Element::new("presence", ns::CLIENT)
             .attr_set("from", "a@b")

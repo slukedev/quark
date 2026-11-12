@@ -222,6 +222,12 @@ async fn local_iq(srv: &Arc<Server>, host: &Arc<Host>, from: Jid, to: Jid, el: E
         return bounce_iq(srv, session, &el, StanzaError::bad_request()).await;
     };
     if target == IqTarget::Account && !srv.accounts.exists(&host.domain, to.node().unwrap_or_default()).await.unwrap_or(false) {
+        // XEP-0030 §8: disco#items on an account that doesn't exist is an empty list, so it
+        // looks the same as one with nothing to show.
+        if kind == IqType::Get && payload.is("query", ns::DISCO_ITEMS) {
+            let q = Element::new("query", ns::DISCO_ITEMS).attr_opt("node", payload.attr("node"));
+            return reply(srv, session, iq_result(&el).child(q)).await;
+        }
         return bounce_iq(srv, session, &el, StanzaError::service_unavailable()).await;
     }
     if payload.is("session", ns::SESSION) && kind == IqType::Set && (target == IqTarget::Server || from.to_bare() == to) {
@@ -360,7 +366,11 @@ pub async fn deliver_message(srv: &Arc<Server>, host: &Arc<Host>, from: &Jid, to
         if kind == "groupchat" {
             return bounce(srv, &msg, StanzaError::service_unavailable()).await;
         }
-        if matches!(kind.as_str(), "headline" | "error") && !srv.sessions.available_of(&bare).iter().any(|s| s.priority() >= 0) {
+        // RFC 6121 §8.5.2.1.1: an error to the bare JID is silently ignored.
+        if kind == "error" {
+            return;
+        }
+        if kind == "headline" && !srv.sessions.available_of(&bare).iter().any(|s| s.priority() >= 0) {
             return;
         }
     }
@@ -404,7 +414,7 @@ pub async fn deliver_message(srv: &Arc<Server>, host: &Arc<Host>, from: &Jid, to
     // use several devices at once and expect the message on each.
     let targets: Vec<_> = available.into_iter().filter(|s| s.priority() >= 0).collect();
     if targets.is_empty() {
-        if kind == "headline" || kind == "error" {
+        if kind == "headline" {
             return;
         }
         let cx = StanzaCtx { srv, host, from, to: &bare, session: None };
@@ -426,11 +436,10 @@ pub async fn deliver_message(srv: &Arc<Server>, host: &Arc<Host>, from: &Jid, to
             }
         }
     }
+    // Each copy keeps the `to` it was sent with (RFC 6121 §8.5.2.1.1: never rewritten).
     let last = targets.len() - 1;
     for (i, s) in targets.into_iter().enumerate() {
-        let mut m = if i == last { std::mem::replace(&mut msg, Element::new("message", ns::CLIENT)) } else { msg.clone() };
-        m.set_attr("to", s.jid.to_string());
-        s.send(m);
+        s.send(if i == last { std::mem::replace(&mut msg, Element::new("message", ns::CLIENT)) } else { msg.clone() });
     }
 }
 
