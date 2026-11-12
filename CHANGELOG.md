@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 - 2026-11-12
 
 Quark is now free software under the GNU GPL, version 3 or later, and targets Linux.
 

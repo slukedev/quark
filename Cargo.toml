@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/core", "crates/server", "crates/testkit", "crates/mcp"]
 
 [workspace.package]
-version = "0.1.3"
+version = "0.2.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/slukedev/quark"
@@ -14,8 +14,8 @@ categories = ["network-programming"]
 rust-version = "1.89"
 
 [workspace.dependencies]
-quark-core = { path = "crates/core", version = "0.1.3" }
-quark-mcp = { path = "crates/mcp", version = "0.1.3" }
+quark-core = { path = "crates/core", version = "0.2.0" }
+quark-mcp = { path = "crates/mcp", version = "0.2.0" }
 
 [profile.release]
 lto = "thin"
