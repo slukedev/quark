@@ -394,6 +394,13 @@ impl Negotiation {
         if self.host.as_ref().is_some_and(|h| h.domain != host.domain) {
             return Err(Some(StreamError::new("host-unknown")));
         }
+        // Web transports can't upgrade: refuse plain ones up front instead of offering sign-in.
+        if !t.secure() && !t.can_starttls() && self.srv.config().tls.require_c2s {
+            return Err(Some(StreamError::with_text(
+                "policy-violation",
+                "This server only accepts encrypted connections: use https:// or wss:// (behind a TLS proxy that sets X-Forwarded-Proto).",
+            )));
+        }
         self.host = Some(host.clone());
         let features = self.features(t, &host);
         t.send(&features).await.map_err(|_| None)

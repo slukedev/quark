@@ -245,16 +245,18 @@ async fn pre_approval_is_pushed_with_approved_true() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn subscribing_again_when_already_subscribed_is_auto_approved() -> anyhow::Result<()> {
+async fn subscribing_again_when_already_subscribed_changes_nothing() -> anyhow::Result<()> {
     let s = server(&["alice", "bob"]).await?;
     let mut a = s.online("alice", PW, "phone").await?;
     let mut b = s.online("bob", PW, "laptop").await?;
     subscribe(&mut a, &mut b).await?;
 
     send_presence(&mut a, &bare("bob"), "subscribe").await?;
-    // §3.1.3: the contact's server MUST auto-reply 'subscribed'; the request is not delivered.
-    expect_presence(&mut a, &bare("bob"), "subscribed").await?;
+    // §3.1.3: the contact's server auto-replies 'subscribed' and doesn't deliver the request;
+    // §3.1.6: with no pending ask, the user's server drops that reply. Clients that acknowledge
+    // every approval with another 'subscribe' would otherwise loop forever.
     assert_none(&mut b, "a second subscription request", |e| e.name() == "presence" && ptype(e) == "subscribe").await?;
+    assert_none(&mut a, "an approval or roster push", |e| (e.name() == "presence" && ptype(e) == "subscribed") || e.name() == "iq").await?;
     Ok(())
 }
 

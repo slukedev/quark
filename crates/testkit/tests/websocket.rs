@@ -62,9 +62,11 @@ async fn close_is_answered_with_close() -> anyhow::Result<()> {
 async fn plain_http_without_a_tls_proxy_cannot_sign_in() -> anyhow::Result<()> {
     let s = TestServer::start().await?;
     s.add_user("alice", "password-a").await?;
-    let mut c = WsClient::connect(s.web(), s.domain(), &[]).await?;
-    c.send(&Element::new("auth", ns::SASL).attr_set("mechanism", "PLAIN").text("AGFsaWNlAHBhc3N3b3JkLWE=")).await?;
+    // Refused at <open/>, before any sign-in is offered (RFC 6120 §5.3.1).
+    let mut c = WsClient::handshake(s.web(), &[]).await?;
+    c.send(&Element::new("open", ns::FRAMING).attr_set("to", s.domain()).attr_set("version", "1.0")).await?;
     let rest = c.expect_closed().await?;
+    assert!(!rest.iter().any(|e| e.is("features", ns::STREAM)), "{rest:?}");
     let err = rest.iter().find(|e| e.is("error", ns::STREAM)).expect("a stream error");
     assert!(err.has_child("policy-violation", ns::STREAMS));
     Ok(())

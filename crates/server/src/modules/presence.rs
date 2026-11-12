@@ -257,15 +257,10 @@ async fn outbound_subscription(
     let mut it = existing.clone().unwrap_or_else(|| Item::new(contact.clone()));
     match kind {
         "subscribe" => {
-            if it.subscription.receives_from_contact() {
-                // Already subscribed: confirm on the contact's behalf instead of asking again.
-                let ok = Element::new("presence", ns::CLIENT).attr_set("from", contact.to_string()).attr_set("type", "subscribed");
-                for s in srv.sessions.available_of(&me) {
-                    s.send(ok.clone().attr_set("to", s.jid.to_string()));
-                }
-                return Ok(());
-            }
-            if !it.ask {
+            // Already subscribed: passed on without asking again (RFC 6121 §3.1.2). The contact's
+            // automatic "subscribed" then finds no pending ask and is dropped (§3.1.6); echoing
+            // one here sent clients that acknowledge approvals into an endless loop.
+            if !it.ask && !it.subscription.receives_from_contact() {
                 it.ask = true;
                 it.visible = true;
                 roster::save_and_push(srv, host, user, &it).await?;
