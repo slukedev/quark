@@ -120,6 +120,7 @@ pub async fn run(config: PathBuf) -> anyhow::Result<()> {
         }
     }
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    crate::modules::mam::settle(&srv).await;
     Ok(())
 }
 

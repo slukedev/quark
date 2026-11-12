@@ -8,6 +8,7 @@
 //! already knows and compressed with a preset dictionary of common stanza text (see [`codec`]).
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -18,8 +19,9 @@ use quark_core::{ns, Condition, Element, Jid, StanzaError};
 use rusqlite::types::Value;
 
 use super::{ok, Event, Flow, IqCtx, IqReply, IqResult, IqTarget, Module, StanzaCtx};
-use crate::db::{params, DbError, Migration, OptionalExtension};
+use crate::db::{params, Db, DbError, Migration, OptionalExtension};
 use crate::server::{Host, Server};
+use tokio::sync::{mpsc, oneshot, OnceCell};
 
 pub static MIGRATION: Migration = Migration {
     module: "mam",
@@ -91,6 +93,121 @@ pub struct Mam;
 struct State {
     /// Archiving preferences by account (absent: not loaded yet).
     prefs: Mutex<HashMap<Jid, Arc<Prefs>>>,
+    archiver: OnceCell<Arc<Archiver>>,
+}
+
+/// Rows waiting for the archive writer before they're committed.
+const WRITE_QUEUE: usize = 4096;
+/// Rows committed in one transaction at most.
+const WRITE_BATCH: usize = 512;
+
+/// Archives messages without making the sender wait for the database: ids are handed out
+/// here, in order, and one task commits the rows in batches. Everything that reads or changes
+/// archived rows waits for the queue first ([`settle`]), so nobody sees the archive behind.
+struct Archiver {
+    last: AtomicI64,
+    tx: mpsc::Sender<Job>,
+}
+
+enum Job {
+    Row(Row),
+    Settled(oneshot::Sender<()>),
+}
+
+struct Row {
+    id: i64,
+    jid: String,
+    host: String,
+    user: Option<String>,
+    with_bare: String,
+    with_res: Option<String>,
+    text: Option<String>,
+    xml: Vec<u8>,
+}
+
+impl Archiver {
+    async fn start(db: &Db) -> Result<Archiver, DbError> {
+        let last: Option<i64> = db.read(|c| c.query_row("SELECT max(id) FROM mam", [], |r| r.get(0))).await?;
+        let (tx, rx) = mpsc::channel(WRITE_QUEUE);
+        tokio::spawn(write_rows(db.clone(), rx));
+        Ok(Archiver { last: AtomicI64::new(last.unwrap_or(0)), tx })
+    }
+
+    /// The next id: now, or just after the last one when the clock hasn't moved on.
+    fn next_id(&self) -> i64 {
+        let floor = id_floor(quark_core::time::now_ms());
+        let mut id = floor;
+        let _ = self.last.fetch_update(Ordering::AcqRel, Ordering::Acquire, |l| {
+            id = floor.max(l.saturating_add(1));
+            Some(id)
+        });
+        id
+    }
+}
+
+async fn archiver(srv: &Server) -> Result<Arc<Archiver>, DbError> {
+    let st = srv.ext::<State>();
+    st.archiver.get_or_try_init(|| async { Archiver::start(&srv.db).await.map(Arc::new) }).await.cloned()
+}
+
+async fn write_rows(db: Db, mut rx: mpsc::Receiver<Job>) {
+    let mut jobs = Vec::with_capacity(WRITE_BATCH);
+    while rx.recv_many(&mut jobs, WRITE_BATCH).await > 0 {
+        let mut waiting = Vec::new();
+        let mut rows = Vec::new();
+        for j in jobs.drain(..) {
+            match j {
+                Job::Row(r) => rows.push(r),
+                Job::Settled(w) => waiting.push(w),
+            }
+        }
+        if !rows.is_empty() {
+            commit(&db, rows).await;
+        }
+        for w in waiting {
+            let _ = w.send(());
+        }
+    }
+}
+
+/// Commits rows together; if the batch fails, each on its own, so one bad row loses only itself.
+async fn commit(db: &Db, rows: Vec<Row>) {
+    let rows = Arc::new(rows);
+    let all = rows.clone();
+    if db.write(move |t| all.iter().try_for_each(|r| insert_row(t, r))).await.is_ok() {
+        return;
+    }
+    for i in 0..rows.len() {
+        let one = rows.clone();
+        if let Err(e) = db.write(move |t| insert_row(t, &one[i])).await {
+            tracing::warn!(error = %e, archive = %rows[i].jid, "couldn't archive a message");
+        }
+    }
+}
+
+fn insert_row(t: &rusqlite::Transaction<'_>, r: &Row) -> rusqlite::Result<()> {
+    let aid: Option<i64> = t.prepare_cached("SELECT id FROM mam_archives WHERE jid = ?1")?.query_row([&r.jid], |x| x.get(0)).optional()?;
+    let aid = match aid {
+        Some(a) => a,
+        None => t
+            .prepare_cached("INSERT INTO mam_archives (jid, host, user) VALUES (?1, ?2, ?3) RETURNING id")?
+            .query_row(params![r.jid, r.host, r.user], |x| x.get(0))?,
+    };
+    t.prepare_cached("INSERT INTO mam (id, archive, with_bare, with_res, indexed, xml) VALUES (?1, ?2, ?3, ?4, ?5, ?6)")?
+        .execute(params![r.id, aid, r.with_bare, r.with_res, r.text.is_some(), r.xml])?;
+    if let Some(text) = &r.text {
+        t.prepare_cached("INSERT INTO mam_fts (rowid, body) VALUES (?1, ?2)")?.execute(params![r.id, text])?;
+    }
+    Ok(())
+}
+
+/// Waits until every message archived so far is in the database.
+pub async fn settle(srv: &Server) {
+    let Some(a) = srv.ext::<State>().archiver.get().map(|a| a.tx.clone()) else { return };
+    let (tx, rx) = oneshot::channel();
+    if a.send(Job::Settled(tx)).await.is_ok() {
+        let _ = rx.await;
+    }
 }
 
 #[async_trait]
@@ -379,34 +496,18 @@ async fn insert(srv: &Server, host: &str, user: Option<String>, archive: &Jid, w
     let jid = archive.to_string();
     let stored = for_storage(msg, &jid);
     let text = searchable(&stored);
-    // Packing is a few microseconds; done here so the writer lock is only held for the insert.
     let xml = codec::pack(&stored);
-    let (host, with_bare, with_res) = (host.to_string(), with.bare_str(), with.resource().map(str::to_string));
-    let now = quark_core::time::now_ms();
-    srv.db
-        .write(move |t| {
-            let aid: Option<i64> =
-                t.prepare_cached("SELECT id FROM mam_archives WHERE jid = ?1")?.query_row([&jid], |r| r.get(0)).optional()?;
-            let aid = match aid {
-                Some(a) => a,
-                None => t
-                    .prepare_cached("INSERT INTO mam_archives (jid, host, user) VALUES (?1, ?2, ?3) RETURNING id")?
-                    .query_row(params![jid, host, user], |r| r.get(0))?,
-            };
-            let last: Option<i64> = t.prepare_cached("SELECT max(id) FROM mam")?.query_row([], |r| r.get(0))?;
-            let id = id_floor(now).max(last.map_or(0, |l| l.saturating_add(1)));
-            t.prepare_cached("INSERT INTO mam (id, archive, with_bare, with_res, indexed, xml) VALUES (?1, ?2, ?3, ?4, ?5, ?6)")?
-                .execute(params![id, aid, with_bare, with_res, text.is_some(), xml])?;
-            if let Some(text) = text {
-                t.prepare_cached("INSERT INTO mam_fts (rowid, body) VALUES (?1, ?2)")?.execute(params![id, text])?;
-            }
-            Ok(id)
-        })
-        .await
+    let a = archiver(srv).await?;
+    let id = a.next_id();
+    let row =
+        Row { id, jid, host: host.to_string(), user, with_bare: with.bare_str(), with_res: with.resource().map(str::to_string), text, xml };
+    a.tx.send(Job::Row(row)).await.map_err(|_| DbError::Join("the archive writer stopped".into()))?;
+    Ok(id)
 }
 
 /// Deletes an archive (account or room gone).
 pub async fn delete_archive(srv: &Arc<Server>, archive: &Jid) -> Result<(), StanzaError> {
+    settle(srv).await;
     let jid = archive.to_bare().to_string();
     srv.db.write(move |t| t.execute("DELETE FROM mam_archives WHERE jid = ?1", [jid])).await.map_err(db_error)?;
     Ok(())
@@ -417,6 +518,7 @@ pub async fn delete_archive(srv: &Arc<Server>, archive: &Jid) -> Result<(), Stan
 async fn sweep(srv: &Server, host: &Host) {
     let Some(keep) = host.settings().history.keep_ms() else { return };
     let cutoff = id_floor(quark_core::time::now_ms() - keep);
+    settle(srv).await;
     let mut total = 0usize;
     loop {
         let h = host.domain.clone();
@@ -456,6 +558,7 @@ pub async fn fetch(srv: &Server, archive: &Jid, ids: &[String]) -> Vec<(String, 
     if ids.is_empty() {
         return Vec::new();
     }
+    settle(srv).await;
     let jid = archive.to_bare().to_string();
     let r = srv
         .db
@@ -490,6 +593,7 @@ pub async fn tombstone(
     replace: impl FnOnce(&Element) -> Option<Element> + Send + 'static,
 ) -> Result<bool, StanzaError> {
     let Some(id) = decode_id(stanza_id) else { return Ok(false) };
+    settle(srv).await;
     let jid = archive.to_bare().to_string();
     srv.db
         .write(move |t| {
@@ -861,6 +965,7 @@ impl From<rusqlite::Error> for QueryError {
 }
 
 async fn run(srv: &Server, archive: &Jid, q: Query) -> Result<Page, StanzaError> {
+    settle(srv).await;
     let jid = archive.to_bare().to_string();
     let r = srv
         .db
@@ -1034,6 +1139,7 @@ pub async fn query(srv: &Arc<Server>, archive: &Jid, iq: &Element, to: &Jid) -> 
 
 /// The first and last message of an archive (`#extended` metadata).
 pub async fn metadata(srv: &Server, archive: &Jid) -> Result<Element, StanzaError> {
+    settle(srv).await;
     let jid = archive.to_bare().to_string();
     let ends: Option<(i64, i64)> = srv
         .db
