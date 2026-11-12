@@ -60,23 +60,8 @@ impl AdminClient {
     }
 }
 
-#[cfg(unix)]
 async fn connect(path: &Path) -> std::io::Result<tokio::net::UnixStream> {
     tokio::net::UnixStream::connect(path).await
-}
-
-/// On Windows the admin socket is a named pipe (`\\.\pipe\quark-…`).
-#[cfg(windows)]
-async fn connect(path: &Path) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
-    use tokio::net::windows::named_pipe::ClientOptions;
-    const PIPE_BUSY: i32 = 231;
-    for _ in 0..50 {
-        match ClientOptions::new().open(path.as_os_str()) {
-            Err(e) if e.raw_os_error() == Some(PIPE_BUSY) => tokio::time::sleep(Duration::from_millis(50)).await,
-            r => return r,
-        }
-    }
-    ClientOptions::new().open(path.as_os_str())
 }
 
 /// Splits an answer envelope into its value or the refusal.

@@ -50,6 +50,8 @@ rand = "0.8"
 rcgen = "0.13"
 rusqlite = { version = "0.42", features = ["bundled"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+# The effective user id, to check who owns the admin socket (no unsafe libc calls).
+rustix = { version = "1", features = ["process"] }
 # PEM parsing (`PemObject`) needs 1.9 or later.
 rustls-pki-types = "1.9"
 serde = { version = "1", features = ["derive"] }
@@ -72,10 +74,6 @@ webpki-roots = "1"
 qrcode = { version = "0.14", default-features = false }
 httpdate = "1"
 percent-encoding = "2"
-
-[target.'cfg(unix)'.dependencies]
-# The effective user id, to check who owns the admin socket (no unsafe libc calls).
-rustix = { version = "1", features = ["process"] }
 
 [dev-dependencies]
 tempfile = "3"

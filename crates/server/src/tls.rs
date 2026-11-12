@@ -191,7 +191,6 @@ fn write_private(path: &Path, data: &[u8]) -> Result<(), TlsError> {
     use std::io::Write;
     let mut o = std::fs::OpenOptions::new();
     o.write(true).create(true).truncate(true);
-    #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
     let mut f = o.open(path).map_err(|e| TlsError::File(path.to_path_buf(), e.to_string()))?;
     f.write_all(data).map_err(|e| TlsError::File(path.to_path_buf(), e.to_string()))

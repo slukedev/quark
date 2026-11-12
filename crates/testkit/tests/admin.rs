@@ -16,7 +16,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 async fn the_socket_and_token_are_private_and_answer() -> anyhow::Result<()> {
     let s = TestServer::start().await?;
     let dir = s.srv.config().server.data_dir.clone();
-    #[cfg(unix)]
     for f in [quark::admin::SOCKET, quark::admin::TOKEN] {
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(std::fs::metadata(dir.join(f))?.permissions().mode() & 0o777, 0o600, "{f}");

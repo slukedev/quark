@@ -11,28 +11,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::settings::PartialSettings;
 
-/// The config file when none is named: `/etc/quark/quark.toml`, or `%ProgramData%\Quark\quark.toml`
-/// on Windows.
+/// The config file when none is named.
 pub fn default_config() -> PathBuf {
-    config_home().join("quark.toml")
-}
-
-#[cfg(not(windows))]
-fn config_home() -> PathBuf {
-    PathBuf::from("/etc/quark")
-}
-#[cfg(not(windows))]
-fn data_home() -> PathBuf {
-    PathBuf::from("/var/lib/quark")
-}
-
-#[cfg(windows)]
-fn config_home() -> PathBuf {
-    std::env::var_os("ProgramData").map_or_else(|| PathBuf::from(r"C:\ProgramData"), PathBuf::from).join("Quark")
-}
-#[cfg(windows)]
-fn data_home() -> PathBuf {
-    config_home().join("data")
+    PathBuf::from("/etc/quark/quark.toml")
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -414,10 +395,10 @@ fn yes() -> bool {
     true
 }
 fn default_data_dir() -> PathBuf {
-    data_home()
+    PathBuf::from("/var/lib/quark")
 }
 fn default_cert_dir() -> PathBuf {
-    config_home().join("certs")
+    PathBuf::from("/etc/quark/certs")
 }
 fn default_log() -> String {
     "info".into()

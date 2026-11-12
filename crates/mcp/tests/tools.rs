@@ -58,7 +58,6 @@ async fn reply(stream: impl AsyncRead + AsyncWrite, reqs: Arc<Mutex<Vec<Value>>>
     wr.write_all(format!("{out}\n").as_bytes()).await.unwrap();
 }
 
-#[cfg(unix)]
 fn listen(dir: &std::path::Path, serve: impl Fn(tokio::net::UnixStream) + Send + 'static) -> std::path::PathBuf {
     let socket = dir.join("admin.sock");
     let listener = tokio::net::UnixListener::bind(&socket).unwrap();
@@ -68,21 +67,6 @@ fn listen(dir: &std::path::Path, serve: impl Fn(tokio::net::UnixStream) + Send +
         }
     });
     socket
-}
-
-#[cfg(windows)]
-fn listen(dir: &std::path::Path, serve: impl Fn(tokio::net::windows::named_pipe::NamedPipeServer) + Send + 'static) -> std::path::PathBuf {
-    use tokio::net::windows::named_pipe::ServerOptions;
-    let name = format!(r"\\.\pipe\quark-test-{}", dir.file_name().unwrap().to_string_lossy());
-    let mut server = ServerOptions::new().first_pipe_instance(true).create(&name).unwrap();
-    let n = name.clone();
-    tokio::spawn(async move {
-        while server.connect().await.is_ok() {
-            let next = ServerOptions::new().create(&n).unwrap();
-            serve(std::mem::replace(&mut server, next));
-        }
-    });
-    name.into()
 }
 
 fn ok(v: Value) -> Value {

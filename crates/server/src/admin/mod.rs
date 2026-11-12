@@ -1,5 +1,4 @@
-//! The admin API (docs/admin-api.md) over a local socket (a named pipe on Windows) and
-//! `quark ctl`, and over HTTP.
+//! The admin API (docs/admin-api.md) over a Unix socket and `quark ctl`, and over HTTP.
 //!
 //! One JSON request per connection, one JSON response line back. The socket lives at
 //! `<data_dir>/admin.sock` with mode 0600, so only the server's own user (and root) can use it;
@@ -41,9 +40,6 @@ pub const SOCKET: &str = "admin.sock";
 pub fn socket_path(data_dir: &Path) -> PathBuf {
     use sha2::Digest;
     let h = || hex::encode(&sha2::Sha256::digest(data_dir.as_os_str().as_encoded_bytes())[..6]);
-    if cfg!(windows) {
-        return PathBuf::from(format!(r"\\.\pipe\quark-{}", h()));
-    }
     let p = data_dir.join(SOCKET);
     // Leave room for the temporary name used while binding.
     if p.as_os_str().len() <= 90 {
@@ -55,7 +51,6 @@ pub fn socket_path(data_dir: &Path) -> PathBuf {
 /// Makes sure the socket's folder is safe to bind in: the data folder itself, or a fallback
 /// folder created by us with mode 0700. One that exists but belongs to someone else, is a
 /// symlink, or is open to others is refused (someone made it first to catch the socket).
-#[cfg(unix)]
 pub fn prepare_socket_dir(socket: &Path, data_dir: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     let Some(dir) = socket.parent() else { return Ok(()) };
@@ -82,7 +77,6 @@ pub fn prepare_socket_dir(socket: &Path, data_dir: &Path) -> anyhow::Result<()> 
 /// Before sending a request: the socket must belong to us or to the data folder's owner (the
 /// server's user), and outside the data folder sit in a folder of that same owner that nobody
 /// else can enter. A socket that doesn't exist yet is left for `connect` to report.
-#[cfg(unix)]
 pub fn check_socket(socket: &Path, data_dir: &Path) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt;
     let sm = match std::fs::symlink_metadata(socket) {
@@ -200,11 +194,7 @@ pub(crate) fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension(format!("tmp{}", std::process::id()));
     let mut o = std::fs::OpenOptions::new();
     o.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        o.mode(0o600);
-    }
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
     let mut f = o.open(&tmp)?;
     f.write_all(data)?;
     f.sync_all()?;
@@ -212,13 +202,12 @@ pub(crate) fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
-/// Starts the admin socket (a named pipe on Windows); returns the addresses bound (none).
+/// Starts the admin socket; returns the addresses bound (none: it's a Unix socket).
 pub async fn start(srv: &Arc<Server>) -> anyhow::Result<Vec<std::net::SocketAddr>> {
     let dir = srv.config().server.data_dir.clone();
     let d = dir.clone();
     tokio::task::spawn_blocking(move || load_or_create_token(&d)).await??;
     let socket = socket_path(&dir);
-    #[cfg(unix)]
     prepare_socket_dir(&socket, &dir)?;
     local::listen(srv, &socket)?;
     Ok(Vec::new())
@@ -248,7 +237,6 @@ async fn serve_local<S: tokio::io::AsyncRead + tokio::io::AsyncWrite>(srv: &Arc<
     let _ = w.shutdown().await;
 }
 
-#[cfg(unix)]
 mod local {
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
@@ -302,71 +290,6 @@ mod local {
     }
 }
 
-/// On Windows the admin "socket" is a named pipe. Its default security lets only the server's
-/// own user, administrators and SYSTEM write to it, and remote clients are refused.
-#[cfg(windows)]
-mod local {
-    use std::path::Path;
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient, ServerOptions};
-
-    use crate::server::Server;
-
-    /// `ERROR_PIPE_BUSY`: every instance is taken; wait and try again.
-    const PIPE_BUSY: i32 = 231;
-
-    pub fn listen(srv: &Arc<Server>, path: &Path) -> anyhow::Result<()> {
-        let name = path.as_os_str().to_owned();
-        let mut server =
-            ServerOptions::new().first_pipe_instance(true).reject_remote_clients(true).create(&name).map_err(|e| {
-                anyhow::anyhow!("creating the admin pipe {}: {e} (is another Quark using this data folder?)", path.display())
-            })?;
-        tracing::info!(pipe = %path.display(), "admin pipe ready");
-        let srv = srv.clone();
-        let limit = Arc::new(tokio::sync::Semaphore::new(super::CONCURRENT));
-        tokio::spawn(async move {
-            let mut shutdown = srv.shutdown_signal();
-            loop {
-                tokio::select! {
-                    r = server.connect() => if let Err(e) = r {
-                        tracing::warn!(error = %e, "admin pipe accept failed");
-                        tokio::time::sleep(Duration::from_millis(200)).await;
-                        continue;
-                    },
-                    _ = shutdown.changed() => break,
-                }
-                let next = match ServerOptions::new().reject_remote_clients(true).create(&name) {
-                    Ok(n) => n,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "admin pipe stopped");
-                        break;
-                    }
-                };
-                let conn = std::mem::replace(&mut server, next);
-                let Ok(permit) = limit.clone().acquire_owned().await else { break };
-                let srv = srv.clone();
-                tokio::spawn(async move {
-                    super::serve_local(&srv, conn).await;
-                    drop(permit);
-                });
-            }
-        });
-        Ok(())
-    }
-
-    pub async fn connect(path: &Path) -> std::io::Result<NamedPipeClient> {
-        for _ in 0..50 {
-            match ClientOptions::new().open(path.as_os_str()) {
-                Err(e) if e.raw_os_error() == Some(PIPE_BUSY) => tokio::time::sleep(Duration::from_millis(50)).await,
-                r => return r,
-            }
-        }
-        ClientOptions::new().open(path.as_os_str())
-    }
-}
-
 /// Sends one request to the admin socket and returns the response line. Newlines outside JSON
 /// strings are just whitespace (inside, they must be escaped), so pretty-printed input is folded
 /// onto the one line the protocol expects.
@@ -408,7 +331,6 @@ pub async fn ctl(config: &std::path::Path) -> i32 {
     let text = String::from_utf8_lossy(&input);
     let data_dir = data_dir_for(config);
     let socket = socket_path(&data_dir);
-    #[cfg(unix)]
     if let Err(e) = check_socket(&socket, &data_dir) {
         eprintln!("quark ctl: {e}");
         return 1;
@@ -464,7 +386,7 @@ async fn http_api(State(st): State<HttpState>, headers: HeaderMap, body: String)
     ([(header::CONTENT_TYPE, "application/json"), (header::CACHE_CONTROL, "no-store")], out).into_response()
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
 
