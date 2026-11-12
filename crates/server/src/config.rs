@@ -11,10 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::settings::PartialSettings;
 
-/// The config file when none is named.
-pub fn default_config() -> PathBuf {
-    PathBuf::from("/etc/quark/quark.toml")
-}
+pub const DEFAULT_CONFIG: &str = "/etc/quark/quark.toml";
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -640,11 +637,10 @@ impl Config {
         let mut s = String::from(
             "# Quark, the XMPP server. Chat settings (sign-up, history, group chats, files, calls)\n\
              # are changed live with `quark ctl` or Gluon; this file is for the server itself.\n\
-             # Every key is optional. See docs/config.md for the full list.\n\n",
+             # Every key is optional. See docs/config.md for the full list.\n\n\
+             [server]\ndata_dir = \"/var/lib/quark\"\nlog = \"info\"\n\n\
+             [tls]\ncert_dir = \"/etc/quark/certs\"\n\n",
         );
-        let path = |p: PathBuf| toml::Value::String(p.to_string_lossy().into_owned());
-        s.push_str(&format!("[server]\ndata_dir = {}\nlog = \"info\"\n\n", path(default_data_dir())));
-        s.push_str(&format!("[tls]\ncert_dir = {}\n\n", path(default_cert_dir())));
         for d in domains {
             let mine: Vec<String> = admins.iter().filter(|a| a.ends_with(&format!("@{d}"))).map(|a| format!("\"{a}\"")).collect();
             s.push_str(&format!("[[host]]\ndomain = \"{d}\"\nadmins = [{}]\n\n", mine.join(", ")));
