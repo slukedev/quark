@@ -11,7 +11,29 @@ use serde::{Deserialize, Serialize};
 
 use crate::settings::PartialSettings;
 
-pub const DEFAULT_CONFIG: &str = "/etc/quark/quark.toml";
+/// The config file when none is named: `/etc/quark/quark.toml`, or `%ProgramData%\Quark\quark.toml`
+/// on Windows.
+pub fn default_config() -> PathBuf {
+    config_home().join("quark.toml")
+}
+
+#[cfg(not(windows))]
+fn config_home() -> PathBuf {
+    PathBuf::from("/etc/quark")
+}
+#[cfg(not(windows))]
+fn data_home() -> PathBuf {
+    PathBuf::from("/var/lib/quark")
+}
+
+#[cfg(windows)]
+fn config_home() -> PathBuf {
+    std::env::var_os("ProgramData").map_or_else(|| PathBuf::from(r"C:\ProgramData"), PathBuf::from).join("Quark")
+}
+#[cfg(windows)]
+fn data_home() -> PathBuf {
+    config_home().join("data")
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -392,10 +414,10 @@ fn yes() -> bool {
     true
 }
 fn default_data_dir() -> PathBuf {
-    PathBuf::from("/var/lib/quark")
+    data_home()
 }
 fn default_cert_dir() -> PathBuf {
-    PathBuf::from("/etc/quark/certs")
+    config_home().join("certs")
 }
 fn default_log() -> String {
     "info".into()
@@ -637,10 +659,11 @@ impl Config {
         let mut s = String::from(
             "# Quark, the XMPP server. Chat settings (sign-up, history, group chats, files, calls)\n\
              # are changed live with `quark ctl` or Gluon; this file is for the server itself.\n\
-             # Every key is optional. See docs/config.md for the full list.\n\n\
-             [server]\ndata_dir = \"/var/lib/quark\"\nlog = \"info\"\n\n\
-             [tls]\ncert_dir = \"/etc/quark/certs\"\n\n",
+             # Every key is optional. See docs/config.md for the full list.\n\n",
         );
+        let path = |p: PathBuf| toml::Value::String(p.to_string_lossy().into_owned());
+        s.push_str(&format!("[server]\ndata_dir = {}\nlog = \"info\"\n\n", path(default_data_dir())));
+        s.push_str(&format!("[tls]\ncert_dir = {}\n\n", path(default_cert_dir())));
         for d in domains {
             let mine: Vec<String> = admins.iter().filter(|a| a.ends_with(&format!("@{d}"))).map(|a| format!("\"{a}\"")).collect();
             s.push_str(&format!("[[host]]\ndomain = \"{d}\"\nadmins = [{}]\n\n", mine.join(", ")));

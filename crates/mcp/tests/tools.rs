@@ -9,8 +9,7 @@ use quark_mcp::{AdminClient, QuarkMcp};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::ServiceExt;
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixListener;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
 type Answer = dyn Fn(&str, &Value) -> Value + Send + Sync;
 
@@ -38,26 +37,52 @@ impl Fake {
 /// A fake admin socket: one JSON line in, one JSON line out, per connection.
 async fn fake(answer: impl Fn(&str, &Value) -> Value + Send + Sync + 'static) -> Fake {
     let dir = tempfile::tempdir().unwrap();
-    let socket = dir.path().join("admin.sock");
-    let listener = UnixListener::bind(&socket).unwrap();
     let requests = Arc::new(Mutex::new(Vec::new()));
     let (reqs, answer): (_, Arc<Answer>) = (requests.clone(), Arc::new(answer));
+    let serve = move |stream| {
+        let (reqs, answer) = (reqs.clone(), answer.clone());
+        tokio::spawn(reply(stream, reqs, answer));
+    };
+    let socket = listen(dir.path(), serve);
+    Fake { _dir: dir, socket, requests }
+}
+
+async fn reply(stream: impl AsyncRead + AsyncWrite, reqs: Arc<Mutex<Vec<Value>>>, answer: Arc<Answer>) {
+    let (rd, mut wr) = tokio::io::split(stream);
+    let mut line = String::new();
+    BufReader::new(rd).read_line(&mut line).await.unwrap();
+    let req: Value = serde_json::from_str(&line).unwrap();
+    let cmd = req["cmd"].as_str().unwrap_or_default().to_string();
+    let out = answer(&cmd, &req["args"]);
+    reqs.lock().unwrap().push(req);
+    wr.write_all(format!("{out}\n").as_bytes()).await.unwrap();
+}
+
+#[cfg(unix)]
+fn listen(dir: &std::path::Path, serve: impl Fn(tokio::net::UnixStream) + Send + 'static) -> std::path::PathBuf {
+    let socket = dir.join("admin.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
     tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
-            let (reqs, answer) = (reqs.clone(), answer.clone());
-            tokio::spawn(async move {
-                let (rd, mut wr) = stream.into_split();
-                let mut line = String::new();
-                BufReader::new(rd).read_line(&mut line).await.unwrap();
-                let req: Value = serde_json::from_str(&line).unwrap();
-                let cmd = req["cmd"].as_str().unwrap_or_default().to_string();
-                let out = answer(&cmd, &req["args"]);
-                reqs.lock().unwrap().push(req);
-                wr.write_all(format!("{out}\n").as_bytes()).await.unwrap();
-            });
+            serve(stream);
         }
     });
-    Fake { _dir: dir, socket, requests }
+    socket
+}
+
+#[cfg(windows)]
+fn listen(dir: &std::path::Path, serve: impl Fn(tokio::net::windows::named_pipe::NamedPipeServer) + Send + 'static) -> std::path::PathBuf {
+    use tokio::net::windows::named_pipe::ServerOptions;
+    let name = format!(r"\\.\pipe\quark-test-{}", dir.file_name().unwrap().to_string_lossy());
+    let mut server = ServerOptions::new().first_pipe_instance(true).create(&name).unwrap();
+    let n = name.clone();
+    tokio::spawn(async move {
+        while server.connect().await.is_ok() {
+            let next = ServerOptions::new().create(&n).unwrap();
+            serve(std::mem::replace(&mut server, next));
+        }
+    });
+    name.into()
 }
 
 fn ok(v: Value) -> Value {

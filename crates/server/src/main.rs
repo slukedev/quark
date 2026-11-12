@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 #[command(name = "quark", version, about = "XMPP in a box")]
 struct Cli {
     /// The config file.
-    #[arg(long, short, env = "QUARK_CONFIG", default_value = quark::config::DEFAULT_CONFIG, global = true)]
+    #[arg(long, short, env = "QUARK_CONFIG", default_value_os_t = quark::config::default_config(), global = true)]
     config: PathBuf,
     #[command(subcommand)]
     cmd: Option<Cmd>,

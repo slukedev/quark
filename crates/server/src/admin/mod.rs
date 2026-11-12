@@ -1,4 +1,5 @@
-//! The admin API (docs/admin-api.md) over a Unix socket and `quark ctl`, and over HTTP.
+//! The admin API (docs/admin-api.md) over a local socket (a named pipe on Windows) and
+//! `quark ctl`, and over HTTP.
 //!
 //! One JSON request per connection, one JSON response line back. The socket lives at
 //! `<data_dir>/admin.sock` with mode 0600, so only the server's own user (and root) can use it;
@@ -39,13 +40,16 @@ pub const SOCKET: &str = "admin.sock";
 /// read admin requests.
 pub fn socket_path(data_dir: &Path) -> PathBuf {
     use sha2::Digest;
+    let h = || hex::encode(&sha2::Sha256::digest(data_dir.as_os_str().as_encoded_bytes())[..6]);
+    if cfg!(windows) {
+        return PathBuf::from(format!(r"\\.\pipe\quark-{}", h()));
+    }
     let p = data_dir.join(SOCKET);
     // Leave room for the temporary name used while binding.
     if p.as_os_str().len() <= 90 {
         return p;
     }
-    let h = sha2::Sha256::digest(data_dir.as_os_str().as_encoded_bytes());
-    std::env::temp_dir().join(format!("quark-{}", hex::encode(&h[..6]))).join(SOCKET)
+    std::env::temp_dir().join(format!("quark-{}", h())).join(SOCKET)
 }
 
 /// Makes sure the socket's folder is safe to bind in: the data folder itself, or a fallback
@@ -208,32 +212,50 @@ pub(crate) fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
-/// Starts the admin socket listeners; returns the addresses bound (none: it's a Unix socket).
+/// Starts the admin socket (a named pipe on Windows); returns the addresses bound (none).
 pub async fn start(srv: &Arc<Server>) -> anyhow::Result<Vec<std::net::SocketAddr>> {
     let dir = srv.config().server.data_dir.clone();
     let d = dir.clone();
     tokio::task::spawn_blocking(move || load_or_create_token(&d)).await??;
+    let socket = socket_path(&dir);
     #[cfg(unix)]
-    {
-        let socket = socket_path(&dir);
-        prepare_socket_dir(&socket, &dir)?;
-        unix::listen(srv, &socket)?;
-    }
-    #[cfg(not(unix))]
-    tracing::warn!("the admin socket needs a Unix system; use the HTTP admin API instead");
+    prepare_socket_dir(&socket, &dir)?;
+    local::listen(srv, &socket)?;
     Ok(Vec::new())
 }
 
+/// Reads one request line from a local connection and writes the answer line back.
+async fn serve_local<S: tokio::io::AsyncRead + tokio::io::AsyncWrite>(srv: &Arc<Server>, stream: S) {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    let (r, mut w) = tokio::io::split(stream);
+    let mut buf = Vec::new();
+    let mut reader = BufReader::new(r.take(MAX_REQUEST as u64 + 1));
+    match tokio::time::timeout(READ_TIMEOUT, reader.read_until(b'\n', &mut buf)).await {
+        Ok(Ok(_)) => {}
+        _ => return,
+    }
+    let line = if buf.len() > MAX_REQUEST {
+        respond(Err(ApiError::invalid("The request is too big.")))
+    } else {
+        match std::str::from_utf8(&buf) {
+            Ok(t) => handle(srv, t, "socket").await,
+            Err(_) => respond(Err(ApiError::invalid("The request isn't valid UTF-8."))),
+        }
+    };
+    let _ = w.write_all(line.as_bytes()).await;
+    let _ = w.write_all(b"\n").await;
+    let _ = w.flush().await;
+    let _ = w.shutdown().await;
+}
+
 #[cfg(unix)]
-mod unix {
+mod local {
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::sync::Arc;
 
-    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     use tokio::net::{UnixListener, UnixStream};
 
-    use super::{handle, MAX_REQUEST, READ_TIMEOUT};
     use crate::server::Server;
 
     /// Binds the socket under a temporary name, locks it down, then renames it into place, so
@@ -266,7 +288,7 @@ mod unix {
                 let Ok(permit) = limit.clone().acquire_owned().await else { break };
                 let srv = srv.clone();
                 tokio::spawn(async move {
-                    serve(&srv, stream).await;
+                    super::serve_local(&srv, stream).await;
                     drop(permit);
                 });
             }
@@ -275,42 +297,88 @@ mod unix {
         Ok(())
     }
 
-    async fn serve(srv: &Arc<Server>, stream: UnixStream) {
-        let (r, mut w) = stream.into_split();
-        let mut buf = Vec::new();
-        let mut reader = BufReader::new(r.take(MAX_REQUEST as u64 + 1));
-        match tokio::time::timeout(READ_TIMEOUT, reader.read_until(b'\n', &mut buf)).await {
-            Ok(Ok(_)) => {}
-            _ => return,
-        }
-        let line = if buf.len() > MAX_REQUEST {
-            super::respond(Err(super::ApiError::invalid("The request is too big.")))
-        } else {
-            match std::str::from_utf8(&buf) {
-                Ok(t) => handle(srv, t, "socket").await,
-                Err(_) => super::respond(Err(super::ApiError::invalid("The request isn't valid UTF-8."))),
+    pub async fn connect(path: &Path) -> std::io::Result<UnixStream> {
+        UnixStream::connect(path).await
+    }
+}
+
+/// On Windows the admin "socket" is a named pipe. Its default security lets only the server's
+/// own user, administrators and SYSTEM write to it, and remote clients are refused.
+#[cfg(windows)]
+mod local {
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient, ServerOptions};
+
+    use crate::server::Server;
+
+    /// `ERROR_PIPE_BUSY`: every instance is taken; wait and try again.
+    const PIPE_BUSY: i32 = 231;
+
+    pub fn listen(srv: &Arc<Server>, path: &Path) -> anyhow::Result<()> {
+        let name = path.as_os_str().to_owned();
+        let mut server =
+            ServerOptions::new().first_pipe_instance(true).reject_remote_clients(true).create(&name).map_err(|e| {
+                anyhow::anyhow!("creating the admin pipe {}: {e} (is another Quark using this data folder?)", path.display())
+            })?;
+        tracing::info!(pipe = %path.display(), "admin pipe ready");
+        let srv = srv.clone();
+        let limit = Arc::new(tokio::sync::Semaphore::new(super::CONCURRENT));
+        tokio::spawn(async move {
+            let mut shutdown = srv.shutdown_signal();
+            loop {
+                tokio::select! {
+                    r = server.connect() => if let Err(e) = r {
+                        tracing::warn!(error = %e, "admin pipe accept failed");
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        continue;
+                    },
+                    _ = shutdown.changed() => break,
+                }
+                let next = match ServerOptions::new().reject_remote_clients(true).create(&name) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "admin pipe stopped");
+                        break;
+                    }
+                };
+                let conn = std::mem::replace(&mut server, next);
+                let Ok(permit) = limit.clone().acquire_owned().await else { break };
+                let srv = srv.clone();
+                tokio::spawn(async move {
+                    super::serve_local(&srv, conn).await;
+                    drop(permit);
+                });
             }
-        };
-        let _ = w.write_all(line.as_bytes()).await;
-        let _ = w.write_all(b"\n").await;
-        let _ = w.shutdown().await;
+        });
+        Ok(())
+    }
+
+    pub async fn connect(path: &Path) -> std::io::Result<NamedPipeClient> {
+        for _ in 0..50 {
+            match ClientOptions::new().open(path.as_os_str()) {
+                Err(e) if e.raw_os_error() == Some(PIPE_BUSY) => tokio::time::sleep(Duration::from_millis(50)).await,
+                r => return r,
+            }
+        }
+        ClientOptions::new().open(path.as_os_str())
     }
 }
 
 /// Sends one request to the admin socket and returns the response line. Newlines outside JSON
 /// strings are just whitespace (inside, they must be escaped), so pretty-printed input is folded
 /// onto the one line the protocol expects.
-#[cfg(unix)]
 pub async fn request(socket: &Path, req: &str) -> std::io::Result<String> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    let stream = tokio::net::UnixStream::connect(socket).await?;
-    let (r, mut w) = stream.into_split();
+    let mut stream = BufReader::new(local::connect(socket).await?);
     let mut line: String = req.trim().chars().map(|c| if c == '\n' || c == '\r' { ' ' } else { c }).collect();
     line.push('\n');
-    w.write_all(line.as_bytes()).await?;
-    w.shutdown().await?;
+    stream.get_mut().write_all(line.as_bytes()).await?;
+    stream.get_mut().flush().await?;
     let mut out = String::new();
-    BufReader::new(r).read_line(&mut out).await?;
+    stream.read_line(&mut out).await?;
     if out.trim().is_empty() {
         return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "the server closed the connection without answering"));
     }
@@ -341,27 +409,19 @@ pub async fn ctl(config: &std::path::Path) -> i32 {
     let data_dir = data_dir_for(config);
     let socket = socket_path(&data_dir);
     #[cfg(unix)]
-    {
-        if let Err(e) = check_socket(&socket, &data_dir) {
-            eprintln!("quark ctl: {e}");
-            return 1;
-        }
-        match request(&socket, &text).await {
-            Ok(line) => {
-                println!("{line}");
-                0
-            }
-            Err(e) => {
-                eprintln!("quark ctl: the server isn't reachable at {}: {e}", socket.display());
-                1
-            }
-        }
+    if let Err(e) = check_socket(&socket, &data_dir) {
+        eprintln!("quark ctl: {e}");
+        return 1;
     }
-    #[cfg(not(unix))]
-    {
-        let _ = text;
-        eprintln!("quark ctl needs a Unix system ({} isn't available)", socket.display());
-        1
+    match request(&socket, &text).await {
+        Ok(line) => {
+            println!("{line}");
+            0
+        }
+        Err(e) => {
+            eprintln!("quark ctl: the server isn't reachable at {}: {e}", socket.display());
+            1
+        }
     }
 }
 

@@ -5,8 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 /// Answers bigger than this are refused (a snapshot of a big server is a few MB at most).
 const MAX_ANSWER: u64 = 32 << 20;
@@ -49,18 +48,35 @@ impl AdminClient {
 
     async fn exchange(&self, cmd: &str, args: Value) -> Result<Value, AdminError> {
         let unreachable = |source| AdminError::Unreachable { path: self.socket.clone(), source };
-        let mut stream = UnixStream::connect(&self.socket).await.map_err(unreachable)?;
+        let mut stream = connect(&self.socket).await.map_err(unreachable)?;
         let mut line = serde_json::to_vec(&json!({ "cmd": cmd, "args": args })).map_err(|e| AdminError::BadAnswer(e.to_string()))?;
         line.push(b'\n');
         stream.write_all(&line).await.map_err(unreachable)?;
-        // One request per connection: closing our side tells a server reading to EOF we're done.
-        let _ = stream.shutdown().await;
+        stream.flush().await.map_err(unreachable)?;
         let mut buf = Vec::new();
-        (&mut stream).take(MAX_ANSWER).read_to_end(&mut buf).await.map_err(unreachable)?;
-        let end = buf.iter().position(|b| *b == b'\n').unwrap_or(buf.len());
-        let answer: Value = serde_json::from_slice(&buf[..end]).map_err(|e| AdminError::BadAnswer(e.to_string()))?;
+        BufReader::new(stream.take(MAX_ANSWER)).read_until(b'\n', &mut buf).await.map_err(unreachable)?;
+        let answer: Value = serde_json::from_slice(buf.trim_ascii_end()).map_err(|e| AdminError::BadAnswer(e.to_string()))?;
         parse_answer(answer)
     }
+}
+
+#[cfg(unix)]
+async fn connect(path: &Path) -> std::io::Result<tokio::net::UnixStream> {
+    tokio::net::UnixStream::connect(path).await
+}
+
+/// On Windows the admin socket is a named pipe (`\\.\pipe\quark-…`).
+#[cfg(windows)]
+async fn connect(path: &Path) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
+    use tokio::net::windows::named_pipe::ClientOptions;
+    const PIPE_BUSY: i32 = 231;
+    for _ in 0..50 {
+        match ClientOptions::new().open(path.as_os_str()) {
+            Err(e) if e.raw_os_error() == Some(PIPE_BUSY) => tokio::time::sleep(Duration::from_millis(50)).await,
+            r => return r,
+        }
+    }
+    ClientOptions::new().open(path.as_os_str())
 }
 
 /// Splits an answer envelope into its value or the refusal.

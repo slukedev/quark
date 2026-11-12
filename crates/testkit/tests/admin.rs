@@ -14,17 +14,19 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::test]
 async fn the_socket_and_token_are_private_and_answer() -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
     let s = TestServer::start().await?;
     let dir = s.srv.config().server.data_dir.clone();
+    #[cfg(unix)]
     for f in [quark::admin::SOCKET, quark::admin::TOKEN] {
+        use std::os::unix::fs::PermissionsExt;
         assert_eq!(std::fs::metadata(dir.join(f))?.permissions().mode() & 0o777, 0o600, "{f}");
     }
-    let line = quark::admin::request(&dir.join(quark::admin::SOCKET), "{\n  \"cmd\": \"status\"\n}").await?;
+    let sock = quark::admin::socket_path(&dir);
+    let line = quark::admin::request(&sock, "{\n  \"cmd\": \"status\"\n}").await?;
     let v: serde_json::Value = serde_json::from_str(&line)?;
     assert_eq!((v["ok"].clone(), v["value"]["server"].clone()), (json!(true), json!("quark")));
 
-    let bad = quark::admin::request(&dir.join(quark::admin::SOCKET), "{nope").await?;
+    let bad = quark::admin::request(&sock, "{nope").await?;
     assert!(bad.contains("\"code\":\"invalid\""), "{bad}");
     assert_eq!(admin_code(&s, json!({ "cmd": "no.such" })).await, "invalid");
     Ok(())

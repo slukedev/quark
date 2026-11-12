@@ -106,7 +106,7 @@ async fn an_external_relay_secret_switches_the_credentials_to_it() -> anyhow::Re
 
 /// One request over the admin socket, as `quark` and the MCP tools send it.
 async fn admin(s: &TestServer, req: Value) -> anyhow::Result<Value> {
-    let sock = s.srv.config().server.data_dir.join(quark::admin::SOCKET);
+    let sock = quark::admin::socket_path(&s.srv.config().server.data_dir);
     Ok(serde_json::from_str(&quark::admin::request(&sock, &req.to_string()).await?)?)
 }
 
