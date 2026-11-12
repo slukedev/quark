@@ -816,14 +816,15 @@ impl Service {
     fn owner_set(&self, room: &mut Room, q: &Element, out: &mut Out) -> Result<(), StanzaError> {
         if let Some(d) = q.get_child("destroy", ns::MUC_OWNER) {
             let alt = d.attr("jid").and_then(|j| Jid::parse(j).ok()).map(|j| j.to_string());
-            room.destroy(alt.as_deref(), d.child_text("reason", ns::MUC_OWNER).as_deref(), out);
+            let password = d.child_text("password", ns::MUC_OWNER);
+            room.destroy(alt.as_deref(), password.as_deref(), d.child_text("reason", ns::MUC_OWNER).as_deref(), out);
             return Ok(());
         }
         let Some(x) = form::find(q) else { return Err(err(Condition::BadRequest, "Send a settings form, or destroy the room.")) };
         match x.attr("type") {
             Some("cancel") => {
                 if room.locked_since.is_some() {
-                    room.destroy(None, None, out);
+                    room.destroy(None, None, None, out);
                 }
                 Ok(())
             }
@@ -983,7 +984,7 @@ impl Service {
             room.expire();
             let mut out = Out::default();
             if room.locked_since.is_some_and(|t| t.elapsed() > LOCK_TIMEOUT) {
-                room.destroy(None, Some("Nobody finished setting up this group chat."), &mut out);
+                room.destroy(None, None, Some("Nobody finished setting up this group chat."), &mut out);
                 self.finish(srv, &cell, room, out).await;
             } else if room.is_empty() && room.config.persistent && room.empty_since.is_some_and(|t| t.elapsed() > IDLE_UNLOAD) {
                 // Everything is saved already; it comes back from storage when needed.

@@ -262,7 +262,7 @@ pub async fn create_room(srv: &Arc<Server>, r: NewRoom<'_>) -> Result<String, Ro
 /// Destroys a room, telling occupants why.
 pub async fn destroy_room(srv: &Arc<Server>, jid: &str, reason: Option<&str>) -> Result<(), RoomError> {
     let (svc, node) = split(srv, jid)?;
-    match svc.with_room(srv, &node, |room, out| room.destroy(None, reason, out)).await.map_err(internal)? {
+    match svc.with_room(srv, &node, |room, out| room.destroy(None, None, reason, out)).await.map_err(internal)? {
         Some(()) => Ok(()),
         None => Err(not_found(jid)),
     }
