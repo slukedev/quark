@@ -344,9 +344,9 @@ pub fn check_role_change(
     if actor_role != Role::Moderator && actor_aff < Affiliation::Admin {
         return Err(err(Condition::Forbidden, "Only moderators can do that."));
     }
-    if (new == Role::Moderator || target_role == Role::Moderator) && actor_aff < Affiliation::Admin && new != target_role {
-        return Err(err(Condition::Forbidden, "Only admins and owners can make or unmake moderators."));
-    }
+    // The affiliation rules come before the moderator one: a moderator going after an admin or
+    // owner (who are moderators by affiliation) is not-allowed (§5.1.1, §5.1.3, §8.2), not
+    // forbidden.
     if target_aff >= Affiliation::Admin && new < Role::Moderator {
         return Err(err(Condition::NotAllowed, "Admins and owners can't be kicked or silenced; change their affiliation first."));
     }
@@ -356,13 +356,19 @@ pub fn check_role_change(
     if new < target_role && target_aff > Affiliation::None && target_aff >= actor_aff {
         return Err(err(Condition::NotAllowed, "You can't kick or silence someone whose affiliation is at or above yours."));
     }
+    if (new == Role::Moderator || target_role == Role::Moderator) && actor_aff < Affiliation::Admin && new != target_role {
+        return Err(err(Condition::Forbidden, "Only admins and owners can make or unmake moderators."));
+    }
     Ok(())
 }
 
-/// Who may change an affiliation (XEP-0045 §9, §10).
-pub fn check_affiliation_change(actor_aff: Affiliation, old: Affiliation, new: Affiliation) -> Result<(), StanzaError> {
+/// Who may change an affiliation (XEP-0045 §9, §10); `own` when the actor changes their own.
+pub fn check_affiliation_change(actor_aff: Affiliation, old: Affiliation, new: Affiliation, own: bool) -> Result<(), StanzaError> {
     if actor_aff < Affiliation::Admin {
         return Err(err(Condition::Forbidden, "Only admins and owners can change who's a member."));
+    }
+    if own && new == Affiliation::Outcast {
+        return Err(err(Condition::Conflict, "You can't ban yourself."));
     }
     // XEP-0045 §9.1: an admin can't ban an admin or owner.
     if new == Affiliation::Outcast && old >= Affiliation::Admin && actor_aff < Affiliation::Owner {
@@ -653,7 +659,11 @@ impl Room {
         if !own.is_empty() {
             let mine = self.presence_el(&o.nick, base, spec.unavailable, x(real, true), &o.id);
             for to in own {
-                out.send_to(to, mine.clone());
+                let mut p = mine.clone();
+                if let Some((_, id)) = spec.reflect.filter(|(dev, _)| dev == to) {
+                    p.set_attr("id", id);
+                }
+                out.send_to(to, p);
             }
         }
     }
@@ -826,7 +836,8 @@ impl Room {
         let others: Vec<&Jid> = o.sessions.iter().filter(|s| s.jid != *j.from).map(|s| &s.jid).collect();
         // Their other devices and everyone else see the newest device's presence; the new one
         // also gets its join codes.
-        self.send_presence(o, &Spec { own_codes: &own_codes, ..Spec::default() }, &[j.from], true, out);
+        let spec = Spec { own_codes: &own_codes, reflect: reflect(j.from, Some(j.presence)), ..Spec::default() };
+        self.send_presence(o, &spec, &[j.from], true, out);
         if !others.is_empty() {
             self.send_presence(o, &Spec::default(), &others, false, out);
         }
@@ -875,12 +886,18 @@ impl Room {
             if self.logging {
                 own.push(170);
             }
-            self.send_presence(o, &Spec { own_codes: &own, ..Spec::default() }, &[from], allowed, out);
+            self.send_presence(
+                o,
+                &Spec { own_codes: &own, reflect: reflect(from, Some(presence)), ..Spec::default() },
+                &[from],
+                allowed,
+                out,
+            );
             let lim = HistoryLimits::parse(presence.get_child("x", ns::MUC).and_then(|x| x.get_child("history", ns::MUC)), now);
             self.send_join_state(from, lim, out);
         } else if allowed {
             let own: Vec<&Jid> = o.sessions.iter().map(|s| &s.jid).collect();
-            self.send_presence(o, &Spec::default(), &own, true, out);
+            self.send_presence(o, &Spec { reflect: reflect(from, Some(presence)), ..Spec::default() }, &own, true, out);
         }
         Ok(())
     }
@@ -913,13 +930,19 @@ impl Room {
         if sole {
             // The classic rename (§7.6): unavailable with 303 from the old nick, then the new one.
             let Some(mut o) = self.occupants.remove(cur) else { return Ok(()) };
-            self.send_presence(&o, &Spec { unavailable: true, codes: &[303], new_nick: Some(nick), ..Spec::default() }, &[from], true, out);
+            self.send_presence(
+                &o,
+                &Spec { unavailable: true, codes: &[303], new_nick: Some(nick), reflect: reflect(from, Some(presence)), ..Spec::default() },
+                &[from],
+                true,
+                out,
+            );
             o.nick = nick.to_string();
             if let Some(s) = o.sessions.first_mut() {
                 s.presence = base;
             }
             self.by_session.insert(from.clone(), nick.to_string());
-            self.send_presence(&o, &Spec::default(), &[from], true, out);
+            self.send_presence(&o, &Spec { reflect: reflect(from, Some(presence)), ..Spec::default() }, &[from], true, out);
             self.occupants.insert(nick.to_string(), o);
         } else {
             // One device of several moves (or joins another nick of the same person).
@@ -932,7 +955,14 @@ impl Room {
             let Some(o) = self.occupants.get(cur) else { return Ok(()) };
             self.send_presence(
                 o,
-                &Spec { unavailable: true, codes: &[303], new_nick: Some(nick), base: Some(&s.presence), ..Spec::default() },
+                &Spec {
+                    unavailable: true,
+                    codes: &[303],
+                    new_nick: Some(nick),
+                    base: Some(&s.presence),
+                    reflect: reflect(from, Some(presence)),
+                    ..Spec::default()
+                },
                 &[from],
                 left_empty,
                 out,
@@ -957,7 +987,7 @@ impl Room {
             o.sessions.push(s);
             let Some(o) = self.occupants.get(nick) else { return Ok(()) };
             let own: Vec<&Jid> = o.sessions.iter().map(|s| &s.jid).collect();
-            self.send_presence(o, &Spec::default(), &own, true, out);
+            self.send_presence(o, &Spec { reflect: reflect(from, Some(presence)), ..Spec::default() }, &own, true, out);
         }
         Ok(())
     }
@@ -979,7 +1009,14 @@ impl Room {
                 let item = (self.occ_aff(&o), Role::None);
                 self.send_presence(
                     &o,
-                    &Spec { unavailable: true, codes, base: base.as_ref(), item: Some(item), ..Spec::default() },
+                    &Spec {
+                        unavailable: true,
+                        codes,
+                        base: base.as_ref(),
+                        item: Some(item),
+                        reflect: reflect(from, presence),
+                        ..Spec::default()
+                    },
                     &[from],
                     true,
                     out,
@@ -989,7 +1026,14 @@ impl Room {
             let Some(o) = self.occupants.get(&nick) else { return };
             // The device that left hears it left; everyone else sees the remaining device.
             let item = (self.occ_aff(o), Role::None);
-            let spec = Spec { unavailable: true, codes, base: base.as_ref().or(Some(&s.presence)), item: Some(item), ..Spec::default() };
+            let spec = Spec {
+                unavailable: true,
+                codes,
+                base: base.as_ref().or(Some(&s.presence)),
+                item: Some(item),
+                reflect: reflect(from, presence),
+                ..Spec::default()
+            };
             self.send_presence(o, &spec, &[from], false, out);
             let own: Vec<&Jid> = o.sessions.iter().map(|s| &s.jid).collect();
             self.send_presence(o, &Spec::default(), &own, true, out);
@@ -1048,9 +1092,13 @@ impl Room {
         out.closed = true;
     }
 
-    /// Ends the room (XEP-0045 §10.9): everyone is told, with an optional new place to go.
-    pub fn destroy(&mut self, alternate: Option<&str>, reason: Option<&str>, out: &mut Out) {
+    /// Ends the room (XEP-0045 §10.9): everyone is told, with an optional new place to go and
+    /// the password it needs.
+    pub fn destroy(&mut self, alternate: Option<&str>, password: Option<&str>, reason: Option<&str>, out: &mut Out) {
         let mut d = Element::new("destroy", ns::MUC_USER).attr_opt("jid", alternate);
+        if let Some(pw) = password {
+            d.append(Element::new("password", ns::MUC_USER).text(pw));
+        }
         if let Some(r) = reason {
             d.append(Element::new("reason", ns::MUC_USER).text(r));
         }
@@ -1583,7 +1631,7 @@ impl Room {
                 return Err(err(Condition::BadRequest, "Each item needs a role or an affiliation."));
             }
         }
-        self.check_affiliations(actor_aff, &affs)?;
+        self.check_affiliations(actor_aff, Some(&actor_bare), &affs)?;
         let actor = actor_nick.as_deref();
         for c in plan {
             match c {
@@ -1607,13 +1655,13 @@ impl Room {
     /// each is one they may make, the room keeps an owner, and the lists stay within their
     /// limits. Bans and everything else have limits of their own, so a full member list (people
     /// can register themselves) never stops a ban; a change that shrinks a list is always fine.
-    fn check_affiliations(&self, actor_aff: Affiliation, changes: &[(Jid, Affiliation)]) -> Result<(), StanzaError> {
+    fn check_affiliations(&self, actor_aff: Affiliation, actor: Option<&Jid>, changes: &[(Jid, Affiliation)]) -> Result<(), StanzaError> {
         let mut owners: Vec<&Jid> = self.affiliations.iter().filter(|(_, a)| a.affiliation == Affiliation::Owner).map(|(j, _)| j).collect();
         let (standing, bans) = self.affiliation_counts();
         let (mut standing_after, mut bans_after) = (standing, bans);
         let mut planned: HashMap<&Jid, Affiliation> = HashMap::new();
         for (jid, aff) in changes {
-            check_affiliation_change(actor_aff, self.aff(jid, false), *aff)?;
+            check_affiliation_change(actor_aff, self.aff(jid, false), *aff, actor == Some(jid))?;
             owners.retain(|o| *o != jid);
             if *aff == Affiliation::Owner {
                 owners.push(jid);
@@ -1725,7 +1773,7 @@ impl Room {
         let was_persistent = self.config.persistent;
         // A form that's refused leaves everything as it was, a new room still locked included.
         let affs = self.form_affiliations(v)?;
-        self.check_affiliations(Affiliation::Owner, &affs)?;
+        self.check_affiliations(Affiliation::Owner, None, &affs)?;
         let changes = self.config.apply(v).map_err(|t| err(Condition::NotAcceptable, &t))?;
         let was_locked = self.locked_since.take().is_some();
         if self.config.persistent && !was_persistent {
@@ -1920,7 +1968,10 @@ impl Room {
     /// newest device), remembering who asked so the answer finds its way back.
     pub fn relay_iq(&mut self, from: &Jid, nick: &str, iq: &Element) -> Result<Element, StanzaError> {
         let Some(from_nick) = self.by_session.get(from).cloned() else {
-            return Err(err(Condition::NotAcceptable, "You're not in this group chat."));
+            // §6.6: disco to an occupant from outside the room is a bad request.
+            let disco = iq.first_child().is_some_and(|p| p.ns() == ns::DISCO_INFO || p.ns() == ns::DISCO_ITEMS);
+            let c = if disco { Condition::BadRequest } else { Condition::NotAcceptable };
+            return Err(err(c, "You're not in this group chat."));
         };
         let Some(t) = self.occupants.get(nick) else {
             return Err(err(Condition::ItemNotFound, "There's nobody with that nickname here."));
@@ -2009,6 +2060,14 @@ struct Spec<'a> {
     destroy: Option<&'a Element>,
     /// The affiliation and role shown, when not the current ones (leaving: role none).
     item: Option<(Affiliation, Role)>,
+    /// The device whose presence this answers and the id it gave, reflected on that device's
+    /// copy only (XEP-0045 §7.2.3; clients wait for it when leaving or changing nickname).
+    reflect: Option<(&'a Jid, &'a str)>,
+}
+
+/// What [`Spec::reflect`] holds for `presence` from `from`.
+fn reflect<'a>(from: &'a Jid, presence: Option<&'a Element>) -> Option<(&'a Jid, &'a str)> {
+    Some((from, presence?.attr("id")?))
 }
 
 fn aff_row(j: &Jid, a: &AffEntry) -> AffRow {
@@ -2190,7 +2249,10 @@ mod tests {
         r.set_affiliation(&j("a@x"), Affiliation::Owner, None, None, &mut Out::default());
         // Moving the only owner to the admin list with nobody else as owner isn't possible
         // through the form (a blank owner list changes nothing), but the shared check stands.
-        assert_eq!(r.check_affiliations(Affiliation::Owner, &[(j("a@x"), Affiliation::Admin)]).unwrap_err().condition, Condition::Conflict);
+        assert_eq!(
+            r.check_affiliations(Affiliation::Owner, None, &[(j("a@x"), Affiliation::Admin)]).unwrap_err().condition,
+            Condition::Conflict
+        );
         r.configure(&config_form(&[("muc#roomconfig_roomowners", &[]), ("muc#roomconfig_roomadmins", &[])]), &mut Out::default()).unwrap();
         assert_eq!(aff_of(&r, "a@x"), Affiliation::Owner);
     }
@@ -2232,13 +2294,125 @@ mod tests {
             Condition::NotAllowed
         );
         assert!(check_role_change(A::None, Role::Moderator, A::None, Role::Participant, Role::Moderator).is_err());
-        assert!(check_affiliation_change(A::Admin, A::None, A::Outcast).is_ok());
+        assert!(check_affiliation_change(A::Admin, A::None, A::Outcast, false).is_ok());
         // XEP-0045 §9.1: banning an admin or owner is not-allowed for admins.
-        assert_eq!(check_affiliation_change(A::Admin, A::Owner, A::Outcast).unwrap_err().condition, Condition::NotAllowed);
-        assert_eq!(check_affiliation_change(A::Admin, A::Member, A::Admin).unwrap_err().condition, Condition::Forbidden);
-        assert!(check_affiliation_change(A::Admin, A::None, A::Admin).is_err());
-        assert!(check_affiliation_change(A::Owner, A::None, A::Owner).is_ok());
-        assert!(check_affiliation_change(A::Member, A::None, A::Member).is_err());
+        assert_eq!(check_affiliation_change(A::Admin, A::Owner, A::Outcast, false).unwrap_err().condition, Condition::NotAllowed);
+        assert_eq!(check_affiliation_change(A::Admin, A::Member, A::Admin, false).unwrap_err().condition, Condition::Forbidden);
+        assert!(check_affiliation_change(A::Admin, A::None, A::Admin, false).is_err());
+        assert!(check_affiliation_change(A::Owner, A::None, A::Owner, false).is_ok());
+        assert!(check_affiliation_change(A::Member, A::None, A::Member, false).is_err());
+        // §9.1: admins and owners banning themselves get a conflict, whatever else applies.
+        assert_eq!(check_affiliation_change(A::Admin, A::Admin, A::Outcast, true).unwrap_err().condition, Condition::Conflict);
+        assert_eq!(check_affiliation_change(A::Owner, A::Owner, A::Outcast, true).unwrap_err().condition, Condition::Conflict);
+    }
+
+    #[test]
+    fn moderators_going_after_admins_and_owners_are_not_allowed() {
+        use Affiliation as A;
+        let not_allowed = |actor: A, target: A, new: Role| {
+            check_role_change(actor, Role::Moderator, target, Role::Moderator, new).unwrap_err().condition == Condition::NotAllowed
+        };
+        // §8.2: kicking; §5.1.1: revoking voice; §5.1.3: revoking moderator.
+        for actor in [A::None, A::Member, A::Admin] {
+            for target in [A::Admin, A::Owner] {
+                for new in [Role::None, Role::Visitor, Role::Participant] {
+                    assert!(not_allowed(actor, target, new), "{actor:?} → {target:?} as {new:?}");
+                }
+            }
+        }
+        // Unmaking a moderator who's one by role alone is still for admins and owners only.
+        assert_eq!(
+            check_role_change(A::None, Role::Moderator, A::None, Role::Moderator, Role::Participant).unwrap_err().condition,
+            Condition::Forbidden
+        );
+        assert!(check_role_change(A::Admin, Role::Moderator, A::None, Role::Moderator, Role::Participant).is_ok());
+    }
+
+    #[test]
+    fn admins_cant_ban_themselves() {
+        let mut r = room();
+        r.affiliations.insert(j("o@x"), aff(Affiliation::Owner));
+        r.affiliations.insert(j("a@x"), aff(Affiliation::Admin));
+        let ban = |jid: &str| {
+            Element::new("query", ns::MUC_ADMIN)
+                .child(Element::new("item", ns::MUC_ADMIN).attr_set("jid", jid).attr_set("affiliation", "outcast"))
+        };
+        let mut out = Out::default();
+        assert_eq!(r.admin_set(&j("a@x/1"), false, &ban("a@x"), &mut out).unwrap_err().condition, Condition::Conflict);
+        assert_eq!(r.admin_set(&j("o@x/1"), false, &ban("o@x"), &mut out).unwrap_err().condition, Condition::Conflict);
+        assert_eq!(r.admin_set(&j("a@x/1"), false, &ban("o@x"), &mut out).unwrap_err().condition, Condition::NotAllowed);
+        assert_eq!(r.aff(&j("a@x"), false), Affiliation::Admin);
+    }
+
+    fn presence(id: &str, kind: Option<&str>) -> Element {
+        Element::new("presence", ns::CLIENT).attr_set("id", id).attr_opt("type", kind)
+    }
+
+    #[test]
+    fn the_own_presence_reflects_the_clients_id_and_nobody_elses_does() {
+        let mut r = room();
+        join(&mut r, "b@x/1", "bob").unwrap();
+        let mut out = Out::default();
+        let a1 = j("a@x/1");
+        let p = presence("join1", None).child(Element::new("x", ns::MUC));
+        r.join(Join { from: &a1, nick: "alice", presence: &p, admin: false, created: false, now: 0 }, &mut out).unwrap();
+        let ids = |out: &Out| -> Vec<(String, Option<String>)> {
+            out.sent()
+                .filter(|e| e.name() == "presence")
+                .map(|e| (e.attr("to").unwrap_or_default().to_string(), e.attr("id").map(String::from)))
+                .collect()
+        };
+        let mine = out.sent().find(|e| e.attr("to") == Some("a@x/1") && codes(e).contains(&"110".into())).unwrap();
+        assert_eq!(mine.attr("id"), Some("join1"));
+        assert!(ids(&out).iter().all(|(to, id)| to == "a@x/1" || id.is_none()));
+
+        // A second device: an update from it is reflected to it alone.
+        join(&mut r, "a@x/2", "alice").unwrap();
+        let mut out = Out::default();
+        r.presence_from_occupant(&a1, "alice", &presence("away1", None), 0, &mut out).unwrap();
+        assert!(ids(&out).iter().all(|(to, id)| (to == "a@x/1") == (id.as_deref() == Some("away1"))));
+
+        // A nickname change: both the 303 and the new nickname's presence.
+        let mut out = Out::default();
+        r.presence_from_occupant(&a1, "ally", &presence("nick1", None), 0, &mut out).unwrap();
+        let to_a1: Vec<&Element> = out.sent().filter(|e| e.attr("to") == Some("a@x/1")).collect();
+        assert!(to_a1.iter().any(|e| codes(e).contains(&"303".into()) && e.attr("id") == Some("nick1")));
+        assert!(to_a1.iter().any(|e| e.attr("from") == Some("tea@rooms.x/ally") && e.attr("id") == Some("nick1")));
+        assert!(ids(&out).iter().all(|(to, id)| to == "a@x/1" || id.is_none()));
+
+        // Leaving, for the last device and for one of several.
+        join(&mut r, "a@x/3", "ally").unwrap();
+        for (dev, id) in [("a@x/3", "leave3"), ("a@x/1", "leave1"), ("a@x/2", "leave2")] {
+            let mut out = Out::default();
+            r.leave(&j(dev), Some(&presence(id, Some("unavailable"))), &[], &mut out);
+            let mine = out.sent().find(|e| e.attr("to") == Some(dev)).unwrap();
+            assert_eq!(mine.attr("type"), Some("unavailable"));
+            assert!(codes(mine).contains(&"110".into()));
+            assert_eq!(mine.attr("id"), Some(id));
+            assert!(ids(&out).iter().all(|(to, i)| to == dev || i.is_none()), "{dev}");
+        }
+    }
+
+    #[test]
+    fn a_destroyed_room_passes_on_the_alternate_venues_password() {
+        let mut r = room();
+        join(&mut r, "a@x/1", "alice").unwrap();
+        let mut out = Out::default();
+        r.destroy(Some("new@rooms.x"), Some("secret"), Some("Moving."), &mut out);
+        let d = out.sent().next().unwrap().get_child("x", ns::MUC_USER).unwrap().get_child("destroy", ns::MUC_USER).unwrap();
+        assert_eq!(d.attr("jid"), Some("new@rooms.x"));
+        assert_eq!(d.child_text("password", ns::MUC_USER).as_deref(), Some("secret"));
+        assert_eq!(d.child_text("reason", ns::MUC_USER).as_deref(), Some("Moving."));
+    }
+
+    #[test]
+    fn disco_on_an_occupant_from_outside_is_a_bad_request() {
+        let mut r = room();
+        join(&mut r, "a@x/1", "alice").unwrap();
+        let iq = |ns: &str| Element::new("iq", ns::CLIENT).attr_set("type", "get").attr_set("id", "q").child(Element::new("query", ns));
+        assert_eq!(r.relay_iq(&j("e@x/1"), "alice", &iq(ns::DISCO_INFO)).unwrap_err().condition, Condition::BadRequest);
+        assert_eq!(r.relay_iq(&j("e@x/1"), "alice", &iq(ns::DISCO_ITEMS)).unwrap_err().condition, Condition::BadRequest);
+        assert_eq!(r.relay_iq(&j("e@x/1"), "alice", &iq(ns::VERSION)).unwrap_err().condition, Condition::NotAcceptable);
     }
 
     #[test]

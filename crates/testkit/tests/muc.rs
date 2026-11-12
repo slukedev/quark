@@ -316,6 +316,43 @@ async fn nicknames_conflict_and_change() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// XEP-0045 §7.2.3: the room reflects the id of the presence it answers on the sender's own copy
+/// (Smack waits for it on leaving and changing nickname); the others' copies carry none.
+#[tokio::test]
+async fn the_own_presence_carries_the_clients_id() -> anyhow::Result<()> {
+    let s = TestServer::start().await?;
+    let mut alice = person(&s, "alice").await?;
+    let mut bob = person(&s, "bob").await?;
+    make_room(&mut alice, "tea", "alice").await?;
+    let bob_at = occ("tea", "bob");
+    let me = join_with(&mut bob, &bob_at, join_presence(&bob_at).attr_set("id", "join1")).await?;
+    assert_eq!(me.attr("id"), Some("join1"));
+    let seen = alice.expect(|e| e.attr("from") == Some(&bob_at)).await?;
+    assert_eq!(seen.attr("id"), None);
+
+    bob.send(&presence(Some(&bob_at), None).attr_set("id", "away1").text_child("show", ns::CLIENT, "away")).await?;
+    let me = bob.expect(|e| e.attr("from") == Some(&bob_at) && codes(e).contains(&110)).await?;
+    assert_eq!(me.attr("id"), Some("away1"));
+    assert_eq!(alice.expect(|e| e.attr("from") == Some(&bob_at)).await?.attr("id"), None);
+
+    let robert = occ("tea", "robert");
+    bob.send(&presence(Some(&robert), None).attr_set("id", "nick1")).await?;
+    let old = bob.expect(|e| e.attr("from") == Some(&bob_at) && codes(e).contains(&303)).await?;
+    assert_eq!(old.attr("id"), Some("nick1"));
+    let new = bob.expect(|e| e.attr("from") == Some(&robert) && codes(e).contains(&110)).await?;
+    assert_eq!(new.attr("id"), Some("nick1"));
+    assert_eq!(alice.expect(|e| e.attr("from") == Some(&bob_at)).await?.attr("id"), None);
+    assert_eq!(alice.expect(|e| e.attr("from") == Some(&robert)).await?.attr("id"), None);
+
+    bob.send(&presence(Some(&robert), Some("unavailable")).attr_set("id", "leave1")).await?;
+    let gone = bob.expect(|e| e.attr("from") == Some(&robert) && e.attr("type") == Some("unavailable")).await?;
+    assert!(codes(&gone).contains(&110));
+    assert_eq!(gone.attr("id"), Some("leave1"));
+    let seen = alice.expect(|e| e.attr("from") == Some(&robert) && e.attr("type") == Some("unavailable")).await?;
+    assert_eq!(seen.attr("id"), None);
+    Ok(())
+}
+
 #[tokio::test]
 async fn leaving_is_announced_and_temporary_rooms_vanish() -> anyhow::Result<()> {
     let s = TestServer::start().await?;
@@ -581,8 +618,12 @@ async fn destroying_sends_everyone_elsewhere() -> anyhow::Result<()> {
     let mut bob = person(&s, "bob").await?;
     make_room(&mut alice, "old", "alice").await?;
     join(&mut bob, &occ("old", "bob")).await?;
-    let destroy = Element::new("query", MUC_OWNER)
-        .child(Element::new("destroy", MUC_OWNER).attr_set("jid", room("new")).text_child("reason", MUC_OWNER, "We moved"));
+    let destroy = Element::new("query", MUC_OWNER).child(
+        Element::new("destroy", MUC_OWNER)
+            .attr_set("jid", room("new"))
+            .text_child("password", MUC_OWNER, "secret")
+            .text_child("reason", MUC_OWNER, "We moved"),
+    );
     let r = bob.iq_set(Some(&room("old")), destroy.clone()).await?;
     assert_eq!(error_condition(&r).as_deref(), Some("forbidden"));
     let r = alice.iq_set(Some(&room("old")), destroy).await?;
@@ -591,6 +632,8 @@ async fn destroying_sends_everyone_elsewhere() -> anyhow::Result<()> {
     let d = p.get_child("x", ns::MUC_USER).and_then(|x| x.get_child("destroy", ns::MUC_USER)).expect("destroy element");
     assert_eq!(d.attr("jid"), Some(room("new").as_str()));
     assert_eq!(d.child_text("reason", ns::MUC_USER).as_deref(), Some("We moved"));
+    // §10.9: the alternate venue's password goes along.
+    assert_eq!(d.child_text("password", ns::MUC_USER).as_deref(), Some("secret"));
     let info = bob.iq_get(Some(&room("old")), Element::new("query", ns::DISCO_INFO)).await?;
     assert_eq!(error_condition(&info).as_deref(), Some("item-not-found"));
     Ok(())
@@ -734,6 +777,43 @@ async fn self_ping_answers_for_joined_clients_only() -> anyhow::Result<()> {
     assert_eq!(r.attr("type"), Some("result"));
     let r = bob.iq_get(Some(&occ("tea", "bob")), Element::new("ping", ns::PING)).await?;
     assert_eq!(error_condition(&r).as_deref(), Some("not-acceptable"));
+    // XEP-0045 §6.6: disco on an occupant from outside the room is a bad request.
+    for q in [ns::DISCO_INFO, ns::DISCO_ITEMS] {
+        let r = bob.iq_get(Some(&occ("tea", "alice")), Element::new("query", q)).await?;
+        assert_eq!(error_condition(&r).as_deref(), Some("bad-request"), "{r}");
+    }
+    Ok(())
+}
+
+/// XEP-0045 §5.1.1, §5.1.3, §8.2, §9.1: moderators going after admins and owners, and admins
+/// going after owners, are not-allowed; banning yourself is a conflict.
+#[tokio::test]
+async fn moderators_and_admins_cant_go_after_those_above_them_or_ban_themselves() -> anyhow::Result<()> {
+    let s = TestServer::start().await?;
+    let mut alice = person(&s, "alice").await?;
+    let mut bob = person(&s, "bob").await?;
+    let mut carol = person(&s, "carol").await?;
+    make_room(&mut alice, "tea", "alice").await?;
+    for (who, aff) in [("bob@quark.test", "admin"), ("carol@quark.test", "member")] {
+        let r = alice.iq_set(Some(&room("tea")), admin_item(&[("jid", who), ("affiliation", aff)])).await?;
+        assert_eq!(r.attr("type"), Some("result"), "{r}");
+    }
+    join(&mut bob, &occ("tea", "bob")).await?;
+    join(&mut carol, &occ("tea", "carol")).await?;
+    let r = alice.iq_set(Some(&room("tea")), admin_item(&[("nick", "carol"), ("role", "moderator")])).await?;
+    assert_eq!(r.attr("type"), Some("result"), "{r}");
+
+    // Carol, a member and moderator: kicking the admin or the owner, silencing or unmaking the owner.
+    for (nick, role) in [("bob", "none"), ("alice", "none"), ("alice", "visitor"), ("alice", "participant")] {
+        let r = carol.iq_set(Some(&room("tea")), admin_item(&[("nick", nick), ("role", role)])).await?;
+        assert_eq!(error_condition(&r).as_deref(), Some("not-allowed"), "{nick} as {role}: {r}");
+    }
+    let r = bob.iq_set(Some(&room("tea")), admin_item(&[("jid", "alice@quark.test"), ("affiliation", "outcast")])).await?;
+    assert_eq!(error_condition(&r).as_deref(), Some("not-allowed"), "{r}");
+    for (c, me) in [(&mut bob, "bob@quark.test"), (&mut alice, "alice@quark.test")] {
+        let r = c.iq_set(Some(&room("tea")), admin_item(&[("jid", me), ("affiliation", "outcast")])).await?;
+        assert_eq!(error_condition(&r).as_deref(), Some("conflict"), "{me}: {r}");
+    }
     Ok(())
 }
 
