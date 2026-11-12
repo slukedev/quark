@@ -3,6 +3,7 @@ name = "quark-testkit"
 description = "Runs a real Quark server in-process and talks to it like a client, for tests"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 publish = false
 autotests = false
@@ -12,7 +13,7 @@ name = "protocol"
 path = "tests/main.rs"
 
 [dependencies]
-quark = { path = "../server" }
+quark = { path = "../server", version = "0.1.3" }
 quark-core.workspace = true
 anyhow = "1"
 base64 = "0.22"

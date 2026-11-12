@@ -3,19 +3,17 @@ on:
   schedule:
     - cron: "0 6 * * 1"
   push:
-    paths: ["Cargo.lock"]
+    branches: [main]
+    paths: ["**/Cargo.toml", "Cargo.lock", "deny.toml"]
+  pull_request:
+    paths: ["**/Cargo.toml", "Cargo.lock", "deny.toml"]
 
-# audit-check reports through a check run, and opens issues for advisories on scheduled runs.
 permissions:
   contents: read
-  checks: write
-  issues: write
 
 jobs:
-  audit:
+  deny:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: EmbarkStudios/cargo-deny-action@v2

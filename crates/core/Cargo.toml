@@ -3,6 +3,7 @@ name = "quark-core"
 description = "XML, JID and stanza primitives for the Quark XMPP server"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true

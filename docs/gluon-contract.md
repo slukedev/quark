@@ -21,4 +21,4 @@ Gluon (`src/server/chat/quark.ts`, `quark-map.ts`, `backend.ts`) drives Quark th
    stale saves).
 7. **`invite.page` is null when the web side is off**; Gluon then uses its own page and
    `invite.peek`.
-8. Image `ghcr.io/reallukedev/quark:0.1`; project URL `https://github.com/reallukedev/quark`.
+8. Image `ghcr.io/slukedev/quark:0.1`; project URL `https://github.com/slukedev/quark`.

@@ -9,8 +9,7 @@ homepage.workspace = true
 authors.workspace = true
 keywords.workspace = true
 categories.workspace = true
-# rmcp needs a newer compiler than the rest of the workspace.
-rust-version = "1.88"
+rust-version.workspace = true
 
 [dependencies]
 rand = "0.8"

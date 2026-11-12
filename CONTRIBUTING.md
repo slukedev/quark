@@ -32,4 +32,4 @@ touch one module plus its tests. Some ground rules:
 
 Keep pull requests focused, and describe what changed and how you tested it.
 
-By contributing you agree that your contributions are licensed under the [MIT License](LICENSE).
+By contributing you agree that your contributions are licensed under the [GNU GPL, version 3 or later](LICENSE).
