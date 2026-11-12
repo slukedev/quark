@@ -3,13 +3,18 @@
 XMPP in a box. One Rust binary (or one small container) that is a complete, modern chat server:
 accounts and invites, group chats, history on every device, photos and files, push to phones,
 calls with a built-in relay, federation, and web chat. Settings change live, certificates reload
-themselves, and everything is managed through one JSON admin API — which is how
+themselves, and everything is managed through one JSON admin API, which is how
 [Gluon](https://github.com/reallukedev/gluon) runs it.
 
 Works with the apps people use: Conversations, Monal, Siskin, Gajim, Dino, Cheogram, Movim,
-Converse.js.
+Converse.js, Profanity, Poezio and the rest. Compatibility is checked against real client code,
+not just Quark's own test client (see [Tested with](#tested-with)).
+
+Quark runs on Linux. It is free software under the GNU GPL, version 3 or later.
 
 ## Run it
+
+With Docker:
 
 ```sh
 docker build -t quark .
@@ -23,10 +28,17 @@ echo '{"cmd":"account.create","args":{"host":"chat.example.com","user":"you","pa
   | docker exec -i quark quark ctl
 ```
 
-Or from source: `cargo run --release -- --config quark.toml`. On first start without a config,
-Quark writes a starter one from `QUARK_DOMAIN`/`QUARK_ADMINS`. Put a real certificate in
-`/etc/quark/certs/<domain>.crt` + `.key` (Gluon copies Caddy's for you); until then Quark uses a
-self-signed one.
+Or download a binary for x86_64 or aarch64 Linux from the
+[releases](https://github.com/slukedev/quark/releases), or build one (Rust 1.89 or newer):
+
+```sh
+cargo build --release
+./target/release/quark --config quark.toml
+```
+
+On first start without a config, Quark writes a starter one from `QUARK_DOMAIN`/`QUARK_ADMINS`.
+Put a real certificate in `/etc/quark/certs/<domain>.crt` + `.key` (Gluon copies Caddy's for
+you); until then Quark uses a self-signed one.
 
 Point DNS (and ideally SRV records `_xmpp-client._tcp`, `_xmpps-client._tcp`,
 `_xmpp-server._tcp`) at the box, and a TLS proxy such as Caddy at port 5280 for web chat, uploads
@@ -62,7 +74,7 @@ stanza ids (XEP-0359), retention that follows the history setting.
 moderation (XEP-0425), room avatars, persistent rooms, direct and mediated invites.
 
 **Personal eventing:** PEP/PubSub (XEP-0163/0060) with entity caps (XEP-0115), publish-options
-and access models — OMEMO keys, avatars (XEP-0084, synced with vCard XEP-0398), nicknames,
+and access models: OMEMO keys, avatars (XEP-0084, synced with vCard XEP-0398), nicknames,
 bookmarks 2 (XEP-0402, synced with legacy XEP-0048/0411), vCard4.
 
 **Files and web:** HTTP file upload (XEP-0363) with quotas and optional photo metadata stripping,
@@ -92,6 +104,26 @@ administration (XEP-0050/0133), ping, time, version, last activity, account expo
 - Stranger filter: link-carrying messages from unknown remote senders are rate-limited and never
   wake phones.
 
+## Tested with
+
+Besides its own protocol suite (about 600 tests that drive a real server over the wire), Quark is
+checked with the libraries real apps are built on:
+
+| Client code | Used by | Covers |
+|---|---|---|
+| [XMPP Interop Testing](https://xmpp-interop-testing.github.io/) (Smack) | Smack-based apps; the suite Openfire, ejabberd and Prosody run | ~900 tests across RFC 6120/6121, MUC, PubSub, MAM, SM, SASL2, FAST, Bind2 ([CI](.github/workflows/interop.yml)) |
+| slixmpp, aioxmpp | Poezio, bots | 140+ scenarios: every XEP above, two libraries talking to each other |
+| Converse.js, Strophe.js, xmpp.js | web chat | WebSocket, BOSH, XEP-0156 discovery, CORS, OMEMO, uploads in a real browser |
+| libstrophe | Profanity | STARTTLS, direct TLS, TLS 1.2 and 1.3, stream resumption |
+| python-nbxmpp | Gajim | SASL2, bookmarks, OMEMO, vCard4 |
+| tokio-xmpp, xmpp-rs | Rust clients | sign-in, MUC, bookmarks, MAM, resumption |
+| mellium, go-xmpp | Go clients, go-sendxmpp | every SASL mechanism, SASL2, Bind2, FAST |
+| loudmouth | mcabber | legacy sign-in and sessions |
+
+[docs/interop.md](docs/interop.md) explains how to run these. Found an app that misbehaves?
+[Open an issue](https://github.com/slukedev/quark/issues/new?template=bug.yml) with the app and
+its version.
+
 ## Layout
 
 `crates/core` (XML, JIDs, stanzas), `crates/server` (the server and `quark` binary),
@@ -102,7 +134,16 @@ the protocol test suite lives in `crates/testkit/tests`). See
 
 ```sh
 cargo test --workspace
-cargo clippy --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-License: [MIT](LICENSE).
+Contributions are welcome: read [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## License
+
+Copyright (C) 2026 Luke and contributors.
+
+Quark is free software: you can redistribute it and/or modify it under the terms of the GNU
+General Public License as published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version. It is distributed in the hope that it will be
+useful, but WITHOUT ANY WARRANTY; see [LICENSE](LICENSE) for details.
