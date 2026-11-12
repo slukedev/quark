@@ -4,7 +4,7 @@
 services:
   quark:
     build: ..
-    image: ghcr.io/slukedev/quark:0.1
+    image: ghcr.io/slukedev/quark:0.2
     restart: unless-stopped
     environment:
       QUARK_DOMAIN: chat.example.com
