@@ -69,7 +69,8 @@ async fn messages_cross_between_servers_with_dialback() -> anyhow::Result<()> {
     let got = bob.expect(is_message).await?;
     assert_eq!(body(&got).as_deref(), Some("hello from a"));
     assert_eq!(got.attr("from"), Some("alice@a.test/phone"));
-    assert_eq!(got.attr("to"), Some("bob@b.test/laptop"));
+    // Sent to the bare JID, delivered with that `to` (RFC 6121 §8.5.2.1.1: never rewritten).
+    assert_eq!(got.attr("to"), Some("bob@b.test"));
 
     bob.send(&message("alice@a.test/phone", "chat", "hello back")).await?;
     let got = alice.expect(is_message).await?;

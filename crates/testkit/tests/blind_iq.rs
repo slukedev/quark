@@ -356,3 +356,47 @@ async fn disco_info_on_an_account_shows_account_registered() -> anyhow::Result<(
     assert!(q.children().any(|i| i.name() == "identity" && i.attr("category") == Some("account")), "{r}");
     Ok(())
 }
+
+#[tokio::test]
+async fn disco_info_on_an_account_needs_its_presence() -> anyhow::Result<()> {
+    let s = server(&["alice", "bob", "carol"]).await?;
+    let mut a = s.online("alice", PW, "phone").await?;
+    let mut b = s.online("bob", PW, "laptop").await?;
+    let mut c = s.online("carol", PW, "desk").await?;
+    // XEP-0030 §8: a stranger gets service-unavailable. (With a node, the node's own access
+    // model decides: PEP nodes such as OMEMO device lists may be open.)
+    let r = c.iq_get(Some(&bare("alice")), Element::new("query", ns::DISCO_INFO)).await?;
+    assert_error(&r, &["service-unavailable"]);
+    // Someone alice only follows (subscription 'to' on her side) doesn't see her presence either.
+    subscribe(&mut a, &mut b).await?;
+    let r = b.iq_get(Some(&bare("alice")), Element::new("query", ns::DISCO_INFO)).await?;
+    assert_error(&r, &["service-unavailable"]);
+    // Alice sees bob's presence, so she may ask about him.
+    let r = a.iq_get(Some(&bare("bob")), Element::new("query", ns::DISCO_INFO)).await?;
+    assert_eq!(r.attr("type"), Some("result"), "{r}");
+    // So may whoever alice sent directed presence to (a group chat she joined, say).
+    a.send(&Element::new("presence", ns::CLIENT).attr_set("to", full("carol", "desk"))).await?;
+    c.expect(|e| is_presence(e, &full("alice", "phone"), "available")).await?;
+    let r = c.iq_get(Some(&bare("alice")), Element::new("query", ns::DISCO_INFO)).await?;
+    assert_eq!(r.attr("type"), Some("result"), "{r}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn disco_items_on_a_missing_account_is_empty() -> anyhow::Result<()> {
+    let s = server(&["alice"]).await?;
+    let mut a = s.online("alice", PW, "phone").await?;
+    let nobody = bare("nobody");
+    // XEP-0030 §8: an empty result, not an error, with or without a node.
+    for node in [None, Some("urn:xmpp:microblog:0")] {
+        let r = a.iq_get(Some(&nobody), Element::new("query", ns::DISCO_ITEMS).attr_opt("node", node)).await?;
+        assert_eq!(r.attr("type"), Some("result"), "{r}");
+        let q = r.get_child("query", ns::DISCO_ITEMS).expect("query");
+        assert_eq!(q.attr("node"), node, "{r}");
+        assert_eq!(q.children().count(), 0, "{r}");
+    }
+    // disco#info on it is still refused.
+    let r = a.iq_get(Some(&nobody), Element::new("query", ns::DISCO_INFO)).await?;
+    assert_error(&r, &["service-unavailable"]);
+    Ok(())
+}

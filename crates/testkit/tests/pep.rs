@@ -689,35 +689,37 @@ async fn deleting_an_account_removes_its_nodes() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A second server, remote.example, federated with `s` (each routed to the other), with Zed.
+async fn remote_peer(s: &TestServer) -> anyhow::Result<TestServer> {
+    let r = TestServer::start_with(Options { domain: Some("remote.example".into()), ..Default::default() }).await?;
+    r.add_user("zed", PW).await?;
+    s.route(r.domain(), &r.s2s().to_string())?;
+    r.route(s.domain(), &s.s2s().to_string())?;
+    Ok(r)
+}
+
+// Notifications to remote contacts are checked on a real federated server: an error bounced
+// back to the account's bare JID is dropped (RFC 6121 §8.5.2.1.1), so it can't stand in.
 #[tokio::test]
 async fn remote_contacts_online_with_notify_caps_get_notifications() -> anyhow::Result<()> {
-    let s = server(&["alice", "bob"]).await?;
+    let s = server(&["alice"]).await?;
+    let r = remote_peer(&s).await?;
     s.roster_set("alice", "zed@remote.example", "both").await?;
+    r.roster_set("zed", &jid("alice"), "both").await?;
     let mut alice = online(&s, "alice", "phone", &[]).await?;
-    // Bob's client has the same caps as Zed's, so the server already knows that `ver`.
-    let mut bob = s.login_as("bob", PW, "pc").await?;
-    let caps = bob.caps(&[NICK_NOTIFY]);
-    bob.send(&presence(None, None).child(caps.clone())).await?;
-    bob.pump(SETTLE).await?;
+    let mut zed = online(&r, "zed", "laptop", &[NICK_NOTIFY]).await?;
+    let zed_full = "zed@remote.example/laptop";
+    alice.expect(|e| e.name() == "presence" && e.attr("from") == Some(zed_full)).await?;
+    zed.pump(SETTLE).await?;
 
-    // Zed's server tells Alice he's online.
-    let zed = "zed@remote.example/laptop";
-    s.srv.route(presence(Some(&jid("alice")), None).attr_set("from", zed).child(caps)).await;
-    alice.expect(|e| e.name() == "presence" && e.attr("from") == Some(zed)).await?;
-
-    // The notification heads to Zed's server; with no federation in tests it bounces back.
     alice.iq_set(None, publish(NICK, Some("current"), nick("Alice"))).await?;
-    alice.expect(|e| e.name() == "message" && e.attr("type") == Some("error") && e.attr("from") == Some(zed)).await?;
+    zed.expect(is_event(NICK)).await?;
 
     // Once he's offline nothing is sent.
-    s.srv.route(presence(Some(&jid("alice")), Some("unavailable")).attr_set("from", zed)).await;
+    zed.send(&presence(None, Some("unavailable"))).await?;
+    alice.expect(|e| e.name() == "presence" && e.attr("from") == Some(zed_full) && e.attr("type") == Some("unavailable")).await?;
     alice.iq_set(None, publish(NICK, Some("current"), nick("Alice 2"))).await?;
-    loop {
-        match alice.recv_within(QUIET).await? {
-            None => break,
-            Some(e) => assert!(e.name() != "message" || e.attr("type") != Some("error"), "{e}"),
-        }
-    }
+    no_events(&mut zed).await?;
     Ok(())
 }
 
@@ -821,35 +823,28 @@ async fn a_client_that_fails_its_caps_query_does_not_hold_up_others() -> anyhow:
 
 #[tokio::test]
 async fn a_remote_contact_approved_later_gets_the_last_items() -> anyhow::Result<()> {
-    let s = server(&["alice", "bob"]).await?;
+    let s = server(&["alice"]).await?;
+    let r = remote_peer(&s).await?;
     // Alice sees Zed's presence; he doesn't see hers yet.
     let zed_bare = "zed@remote.example";
     s.roster_set("alice", zed_bare, "to").await?;
+    r.roster_set("zed", &jid("alice"), "from").await?;
     let mut alice = online(&s, "alice", "phone", &[]).await?;
     alice.iq_set(None, publish(NICK, Some("current"), nick("Alice"))).await?;
-    // Bob's client has the same caps as Zed's, so the server already knows that `ver`.
-    let mut bob = s.login_as("bob", PW, "pc").await?;
-    let caps = bob.caps(&[NICK_NOTIFY]);
-    bob.send(&presence(None, None).child(caps.clone())).await?;
-    bob.pump(SETTLE).await?;
-
-    let zed = "zed@remote.example/laptop";
-    s.srv.route(presence(Some(&jid("alice")), None).attr_set("from", zed).child(caps)).await;
-    alice.expect(|e| e.name() == "presence" && e.attr("from") == Some(zed)).await?;
+    let mut zed = online(&r, "zed", "laptop", &[NICK_NOTIFY]).await?;
+    let zed_full = "zed@remote.example/laptop";
+    alice.expect(|e| e.name() == "presence" && e.attr("from") == Some(zed_full)).await?;
+    zed.pump(SETTLE).await?;
     // Nothing for him yet: he isn't allowed to see her.
     alice.iq_set(None, publish(NICK, Some("current"), nick("Alice 2"))).await?;
-    loop {
-        match alice.recv_within(QUIET).await? {
-            None => break,
-            Some(e) => assert!(e.name() != "message" || e.attr("type") != Some("error"), "{e}"),
-        }
-    }
+    no_events(&mut zed).await?;
 
-    // He asks, she approves: her last nickname heads to his server (and bounces back here).
-    s.srv.route(presence(Some(&jid("alice")), Some("subscribe")).attr_set("from", zed_bare)).await;
+    // He asks, she approves: her last nickname reaches him.
+    zed.send(&presence(Some(&jid("alice")), Some("subscribe"))).await?;
     alice.expect(|e| e.name() == "presence" && e.attr("type") == Some("subscribe")).await?;
     alice.send(&presence(Some(zed_bare), Some("subscribed"))).await?;
-    alice.expect(|e| e.name() == "message" && e.attr("type") == Some("error") && e.attr("from") == Some(zed)).await?;
+    let m = zed.expect(is_event(NICK)).await?;
+    assert!(m.to_xml().contains("Alice 2"), "{m}");
     Ok(())
 }
 

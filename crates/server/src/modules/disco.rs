@@ -54,6 +54,11 @@ impl Module for Disco {
             return Err(StanzaError::item_not_found());
         }
         if cx.payload.ns() == ns::DISCO_INFO {
+            // XEP-0030 §8: only those who may see the account's presence learn about it. A
+            // node has its own access model (a PEP node's), checked by whoever answers for it.
+            if !server && node.is_none() && !super::presence::may_see(cx.srv, cx.host, cx.to.node().unwrap_or_default(), cx.from).await {
+                return Err(StanzaError::service_unavailable());
+            }
             return ok(Element::new("query", ns::DISCO_INFO).attr_opt("node", node).children_from(info(cx, server)));
         }
         let items = if server {

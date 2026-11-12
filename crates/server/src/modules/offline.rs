@@ -68,7 +68,10 @@ pub async fn flush(srv: &Arc<Server>, host: &Arc<Host>, session: &Arc<SessionHan
     rows.sort_by_key(|r| r.0);
     for (_, stamp, xml) in rows {
         let Ok(mut m) = Element::parse(&xml) else { continue };
-        m.set_attr("to", session.jid.to_string());
+        // Delivered with the `to` it was sent with (RFC 6121 §8.5.2.1.1).
+        if m.attr("to").is_none() {
+            m.set_attr("to", session.jid.to_bare().to_string());
+        }
         if !m.has_child("delay", ns::DELAY) {
             m.append(quark_core::stanza::delay(&host.domain, stamp));
         }

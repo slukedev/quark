@@ -87,3 +87,92 @@ async fn offline_messages_wait_for_a_presence_with_priority() -> anyhow::Result<
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn stanzas_to_a_bare_jid_keep_their_to() -> anyhow::Result<()> {
+    let s = TestServer::start().await?;
+    s.add_user("alice", PW).await?;
+    s.add_user("bob", PW).await?;
+    let mut phone = s.online("alice", PW, "phone").await?;
+    let mut laptop = s.login_as("alice", PW, "laptop").await?;
+    laptop.send(&priority(5)).await?;
+    let mut bob = s.online("bob", PW, "desk").await?;
+    let alice = format!("alice@{DOMAIN}");
+
+    // RFC 6121 §8.5.2.1.1: every device gets it, and the server MUST NOT rewrite 'to'.
+    for kind in ["chat", "normal", "headline"] {
+        bob.send(&message(&alice, kind, kind)).await?;
+        for c in [&mut phone, &mut laptop] {
+            let m = c.expect(|e| e.child_text("body", ns::CLIENT).as_deref() == Some(kind)).await?;
+            assert_eq!(m.attr("to"), Some(alice.as_str()), "{m}");
+        }
+    }
+    // §8.5.2.1.2: the same for presence, directed availability and subscription requests alike.
+    bob.send(&Element::new("presence", ns::CLIENT).attr_set("to", &alice)).await?;
+    bob.send(&Element::new("presence", ns::CLIENT).attr_set("to", &alice).attr_set("type", "subscribe")).await?;
+    for c in [&mut phone, &mut laptop] {
+        for kind in [None, Some("subscribe")] {
+            let p = c
+                .expect(|e| e.name() == "presence" && e.attr("from").is_some_and(|f| f.starts_with("bob@")) && e.attr("type") == kind)
+                .await?;
+            assert_eq!(p.attr("to"), Some(alice.as_str()), "{p}");
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_error_message_to_a_bare_jid_is_dropped() -> anyhow::Result<()> {
+    let s = TestServer::start().await?;
+    s.add_user("alice", PW).await?;
+    s.add_user("bob", PW).await?;
+    let mut alice = s.online("alice", PW, "phone").await?;
+    let mut bob = s.online("bob", PW, "desk").await?;
+    // RFC 6121 §8.5.2.1.1: silently ignored, even with a device online at priority ≥ 0.
+    bob.send(&message(&format!("alice@{DOMAIN}"), "error", "oops")).await?;
+    alice.expect_silence(QUIET).await?;
+    bob.expect_silence(QUIET).await?;
+    // To her full JID it still arrives.
+    bob.send(&message(&format!("alice@{DOMAIN}/phone"), "error", "to the device")).await?;
+    alice.expect(|e| e.child_text("body", ns::CLIENT).as_deref() == Some("to the device")).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_subscription_request_kept_for_later_keeps_its_id_and_extensions() -> anyhow::Result<()> {
+    let s = TestServer::start().await?;
+    for u in ["alice", "bob", "carol"] {
+        s.add_user(u, PW).await?;
+    }
+    let mut bob = s.online("bob", PW, "desk").await?;
+    let mut carol = s.online("carol", PW, "desk").await?;
+    let alice = format!("alice@{DOMAIN}");
+    // RFC 6121 §3.1.3: the complete stanza is kept, extended content included.
+    let req = Element::new("presence", ns::CLIENT)
+        .attr_set("to", &alice)
+        .attr_set("type", "subscribe")
+        .attr_set("id", "sub-1")
+        .text_child("status", ns::CLIENT, "Hello")
+        .child(Element::new("x", "urn:example:ext").attr_set("k", "v"));
+    bob.send(&req).await?;
+    // One too big to keep whole keeps only what a person reads.
+    let big = req.clone().attr_set("id", "sub-2").child(Element::new("pad", "urn:example:pad").text("x".repeat(5000)));
+    carol.send(&big).await?;
+    // Each sender's roster push says its request went out.
+    bob.expect(|e| e.name() == "iq").await?;
+    carol.expect(|e| e.name() == "iq").await?;
+
+    let mut a = s.login_as("alice", PW, "phone").await?;
+    a.send(&Element::new("presence", ns::CLIENT)).await?;
+    let from_bob = format!("bob@{DOMAIN}");
+    let p = a.expect(|e| e.name() == "presence" && e.attr("type") == Some("subscribe") && e.attr("from") == Some(&from_bob)).await?;
+    assert_eq!(p.attr("id"), Some("sub-1"), "{p}");
+    assert_eq!(p.attr("to"), Some(alice.as_str()), "{p}");
+    assert_eq!(p.child_text("status", ns::CLIENT).as_deref(), Some("Hello"), "{p}");
+    assert_eq!(p.get_child("x", "urn:example:ext").and_then(|x| x.attr("k")), Some("v"), "{p}");
+    let from_carol = format!("carol@{DOMAIN}");
+    let p = a.expect(|e| e.name() == "presence" && e.attr("type") == Some("subscribe") && e.attr("from") == Some(&from_carol)).await?;
+    assert_eq!(p.child_text("status", ns::CLIENT).as_deref(), Some("Hello"), "{p}");
+    assert!(p.get_child("pad", "urn:example:pad").is_none(), "{p}");
+    Ok(())
+}
