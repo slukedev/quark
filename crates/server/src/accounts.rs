@@ -221,9 +221,24 @@ pub fn valid_username(u: &str) -> bool {
         && b.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || b"._-".contains(c))
 }
 
+/// Who chooses a password.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetBy {
+    /// The account's owner (signing up, changing their own): at least 8 characters.
+    Owner,
+    /// An admin creating or resetting someone's account: their call, as long as it isn't empty.
+    Admin,
+}
+
 pub fn check_password(p: &str) -> Result<(), AccountError> {
-    if p.chars().count() < 8 {
-        return Err(AccountError::Invalid("Passwords are at least 8 characters.".into()));
+    check_password_by(p, SetBy::Owner)
+}
+
+pub fn check_password_by(p: &str, by: SetBy) -> Result<(), AccountError> {
+    match by {
+        SetBy::Owner if p.chars().count() < 8 => return Err(AccountError::Invalid("Passwords are at least 8 characters.".into())),
+        SetBy::Admin if p.is_empty() => return Err(AccountError::Invalid("The password can't be empty.".into())),
+        _ => {}
     }
     if p.len() > 1024 || p.chars().any(|c| c.is_control()) {
         return Err(AccountError::Invalid("That password has characters chat apps can't send.".into()));
@@ -288,12 +303,17 @@ impl Accounts {
     }
 
     pub async fn create(&self, host: &str, user: &str, password: &str, role: Role) -> Result<(), AccountError> {
+        self.create_by(host, user, password, role, SetBy::Owner).await
+    }
+
+    /// [`Accounts::create`], with the password rules for whoever chose it.
+    pub async fn create_by(&self, host: &str, user: &str, password: &str, role: Role, by: SetBy) -> Result<(), AccountError> {
         if !valid_username(user) {
             return Err(AccountError::Invalid(
                 "Usernames use lowercase letters, numbers, dots, dashes or underscores, starting with a letter or number.".into(),
             ));
         }
-        check_password(password)?;
+        check_password_by(password, by)?;
         let jid = format!("{user}@{host}");
         // A taken name is refused before hashing: trying names that exist must stay cheap. The
         // insert below still settles a race between two sign-ups for one name.
@@ -551,7 +571,12 @@ impl Accounts {
     }
 
     pub async fn set_password(&self, host: &str, user: &str, password: &str) -> Result<(), AccountError> {
-        check_password(password)?;
+        self.set_password_by(host, user, password, SetBy::Owner).await
+    }
+
+    /// [`Accounts::set_password`], with the password rules for whoever chose it.
+    pub async fn set_password_by(&self, host: &str, user: &str, password: &str, by: SetBy) -> Result<(), AccountError> {
+        check_password_by(password, by)?;
         let pw = password.to_string();
         let d = self.hashing(move || derive(&pw)).await?;
         let (h, u) = (host.to_string(), user.to_string());
@@ -647,6 +672,18 @@ mod tests {
         assert!(!a.verify_password("a.test", "sam", "wrong horse!").await.unwrap());
         a.set_password("a.test", "sam", "battery staple").await.unwrap();
         assert!(a.verify_password("a.test", "sam", "battery staple").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn only_admins_may_choose_short_passwords() {
+        let a = accounts().await;
+        assert!(matches!(a.create("a.test", "sam", "short", Role::Member).await, Err(AccountError::Invalid(_))));
+        a.create_by("a.test", "sam", "short", Role::Member, SetBy::Admin).await.unwrap();
+        assert!(a.verify_password("a.test", "sam", "short").await.unwrap());
+        assert!(matches!(a.set_password("a.test", "sam", "tiny").await, Err(AccountError::Invalid(_))));
+        a.set_password_by("a.test", "sam", "tiny", SetBy::Admin).await.unwrap();
+        assert!(matches!(a.set_password_by("a.test", "sam", "", SetBy::Admin).await, Err(AccountError::Invalid(_))));
+        assert!(a.verify_password("a.test", "sam", "tiny").await.unwrap());
     }
 
     #[tokio::test]

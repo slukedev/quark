@@ -435,6 +435,38 @@ async fn closing_the_stream_is_answered_with_a_close() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn after_answering_a_close_the_server_lets_the_client_hang_up_first() -> anyhow::Result<()> {
+    // §4.4: the client closes the connection once it has our closing tag. Closing TLS at once
+    // can make a client's TLS layer drop the tag that arrived with the close (Smack does).
+    let s = TestServer::start().await?;
+    s.add_user("alice", "password1").await?;
+    let mut c = s.login("alice", "password1").await?;
+    c.send_raw("</stream:stream>").await?;
+    let err = c.recv().await.expect_err("no closing tag");
+    assert!(err.to_string().contains("closed the stream"), "{err}");
+    assert!(c.recv_within(std::time::Duration::from_millis(500)).await?.is_none(), "the connection closed before the client did");
+    // A client that never hangs up isn't waited for long.
+    let err = c.recv_within(std::time::Duration::from_secs(4)).await.expect_err("the server waited for ever");
+    assert!(err.to_string().contains("closed the connection"), "{err}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_stream_error_arrives_before_the_connection_closes() -> anyhow::Result<()> {
+    let s = TestServer::start().await?;
+    s.add_user("alice", "password1").await?;
+    let mut c = s.login("alice", "password1").await?;
+    c.send_raw("<message to='x@quark.test'><body>hi</message>").await?;
+    let e = c.expect(|e| e.is("error", ns::STREAM)).await?;
+    assert_eq!(stream_error_condition(&e).as_deref(), Some("not-well-formed"), "{e}");
+    let err = c.recv().await.expect_err("no closing tag");
+    assert!(err.to_string().contains("closed the stream"), "{err}");
+    let err = c.recv_within(std::time::Duration::from_secs(2)).await.expect_err("the connection stayed open");
+    assert!(err.to_string().contains("closed the connection"), "{err}");
+    Ok(())
+}
+
+#[tokio::test]
 async fn raw_tcp_garbage_is_not_accepted() -> anyhow::Result<()> {
     // Not XML at all before the header: the server must not hang open forever or answer with
     // features. A stream error (not-well-formed / bad-format) or a closed connection are fine.

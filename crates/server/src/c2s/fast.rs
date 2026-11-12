@@ -8,7 +8,8 @@ use crate::db::{params, Db, Migration};
 
 pub static MIGRATION: Migration = Migration {
     module: "fast",
-    steps: &["CREATE TABLE fast_tokens (
+    steps: &[
+        "CREATE TABLE fast_tokens (
         host TEXT NOT NULL,
         user TEXT NOT NULL,
         agent TEXT NOT NULL,
@@ -19,14 +20,17 @@ pub static MIGRATION: Migration = Migration {
         previous_expires INTEGER,
         PRIMARY KEY (host, user, agent),
         FOREIGN KEY (host, user) REFERENCES accounts(host, user) ON DELETE CASCADE
-    ) WITHOUT ROWID"],
+    ) WITHOUT ROWID",
+        // XEP-0484 §5.1's two slots: `token` is the newest ("new"), `previous` the one in use
+        // ("current"), each bound to its own mechanism; `used` says the newest has been used.
+        "ALTER TABLE fast_tokens ADD COLUMN previous_mechanism TEXT;
+         ALTER TABLE fast_tokens ADD COLUMN used INTEGER NOT NULL DEFAULT 0;
+         UPDATE fast_tokens SET previous_mechanism = mechanism WHERE previous IS NOT NULL;",
+    ],
 };
 
 /// How long a token stays valid.
 pub const LIFETIME_MS: i64 = 30 * 86_400_000;
-/// How long the previous token keeps working after a new one is issued, in case the device
-/// didn't get the new one.
-const OVERLAP_MS: i64 = 86_400_000;
 
 #[derive(Clone)]
 pub struct FastTokens {
@@ -38,7 +42,8 @@ impl FastTokens {
         FastTokens { db }
     }
 
-    /// Issues a new token for a device, keeping the current one as `previous` for a day.
+    /// Issues a new token for a device. The token it has been using keeps working until the new
+    /// one is used (in case the device never got it); a newer one it never used is replaced.
     /// Returns (token, expiry).
     pub async fn issue(&self, host: &str, user: &str, agent: &str, mechanism: &str) -> Result<(String, i64), crate::db::DbError> {
         let mut raw = [0u8; 32];
@@ -51,9 +56,12 @@ impl FastTokens {
             .write(move |tx| {
                 tx.execute(
                     "INSERT INTO fast_tokens (host, user, agent, mechanism, token, expires) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                     ON CONFLICT(host, user, agent) DO UPDATE SET previous = token, previous_expires = MIN(expires, ?7),
-                        token = excluded.token, expires = excluded.expires, mechanism = excluded.mechanism",
-                    params![h, u, a, m, t.as_bytes(), expires, now + OVERLAP_MS],
+                     ON CONFLICT(host, user, agent) DO UPDATE SET
+                        previous = CASE WHEN used THEN token ELSE previous END,
+                        previous_expires = CASE WHEN used THEN expires ELSE previous_expires END,
+                        previous_mechanism = CASE WHEN used THEN mechanism ELSE previous_mechanism END,
+                        token = excluded.token, expires = excluded.expires, mechanism = excluded.mechanism, used = 0",
+                    params![h, u, a, m, t.as_bytes(), expires],
                 )
             })
             .await?;
@@ -78,33 +86,62 @@ impl FastTokens {
 
 #[async_trait::async_trait]
 impl crate::sasl::TokenCheck for FastTokens {
-    async fn tokens(&self, host: &str, user: &str, mechanism: &str) -> Vec<Vec<u8>> {
+    async fn tokens(&self, host: &str, user: &str, mechanism: &str) -> Vec<crate::sasl::Token> {
         let (h, u, m) = (host.to_string(), user.to_string(), mechanism.to_string());
         let now = quark_core::time::now_ms();
         self.db
             .read(move |c| {
                 let mut st = c.prepare_cached(
-                    "SELECT token, expires, previous, previous_expires FROM fast_tokens WHERE host = ?1 AND user = ?2 AND mechanism = ?3",
+                    "SELECT token, expires, mechanism, previous, previous_expires, previous_mechanism FROM fast_tokens
+                     WHERE host = ?1 AND user = ?2",
                 )?;
-                let rows = st.query_map(params![h, u, m], |r| {
-                    Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)?, r.get::<_, Option<Vec<u8>>>(2)?, r.get::<_, Option<i64>>(3)?))
+                let rows = st.query_map(params![h, u], |r| {
+                    Ok((
+                        r.get::<_, Vec<u8>>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, Option<Vec<u8>>>(3)?,
+                        r.get::<_, Option<i64>>(4)?,
+                        r.get::<_, Option<String>>(5)?,
+                    ))
                 })?;
-                let mut out = Vec::new();
+                // Newest first: XEP-0484 §5.1 checks the "new" slot before the "current" one.
+                let mut newest = Vec::new();
+                let mut older = Vec::new();
                 for row in rows {
-                    let (t, e, p, pe) = row?;
-                    if e > now {
-                        out.push(t);
+                    let (t, e, tm, p, pe, pm) = row?;
+                    if e > now && tm == m {
+                        newest.push(crate::sasl::Token { secret: t, newest: true });
                     }
-                    if let (Some(p), Some(pe)) = (p, pe) {
-                        if pe > now {
-                            out.push(p);
+                    if let (Some(p), Some(pe), Some(pm)) = (p, pe, pm) {
+                        if pe > now && pm == m {
+                            older.push(crate::sasl::Token { secret: p, newest: false });
                         }
                     }
                 }
-                Ok(out)
+                newest.append(&mut older);
+                Ok(newest)
             })
             .await
             .unwrap_or_default()
+    }
+
+    /// The newest token was used: every earlier one of that device stops working (§3.5).
+    async fn used(&self, host: &str, user: &str, secret: &[u8]) {
+        let (h, u, t) = (host.to_string(), user.to_string(), secret.to_vec());
+        let r = self
+            .db
+            .write(move |tx| {
+                tx.execute(
+                    "UPDATE fast_tokens SET used = 1, previous = NULL, previous_expires = NULL, previous_mechanism = NULL
+                     WHERE host = ?1 AND user = ?2 AND token = ?3",
+                    params![h, u, t],
+                )
+            })
+            .await;
+        if let Err(e) = r {
+            tracing::warn!(error = %e, "couldn't retire older FAST tokens");
+        }
     }
 }
 
@@ -120,14 +157,28 @@ mod tests {
         FastTokens::new(db)
     }
 
+    async fn valid(s: &FastTokens) -> Vec<Vec<u8>> {
+        s.tokens("a.test", "sam", "HT-SHA-256-NONE").await.into_iter().map(|t| t.secret).collect()
+    }
+
     #[tokio::test]
-    async fn rotation_keeps_previous_token_valid() {
+    async fn rotation_keeps_the_used_token_until_the_new_one_is_used() {
+        let s = store().await;
+        let (t1, _) = s.issue("a.test", "sam", "phone", "HT-SHA-256-NONE").await.unwrap();
+        s.used("a.test", "sam", t1.as_bytes()).await;
+        let (t2, _) = s.issue("a.test", "sam", "phone", "HT-SHA-256-NONE").await.unwrap();
+        assert_eq!(valid(&s).await, vec![t2.clone().into_bytes(), t1.clone().into_bytes()]);
+        s.used("a.test", "sam", t2.as_bytes()).await;
+        assert_eq!(valid(&s).await, vec![t2.into_bytes()], "using the new token retires the old one");
+    }
+
+    #[tokio::test]
+    async fn an_unused_token_is_replaced_by_the_next() {
         let s = store().await;
         let (t1, _) = s.issue("a.test", "sam", "phone", "HT-SHA-256-NONE").await.unwrap();
         let (t2, _) = s.issue("a.test", "sam", "phone", "HT-SHA-256-NONE").await.unwrap();
-        let valid = s.tokens("a.test", "sam", "HT-SHA-256-NONE").await;
-        assert!(valid.contains(&t1.into_bytes()));
-        assert!(valid.contains(&t2.into_bytes()));
+        assert_eq!(valid(&s).await, vec![t2.into_bytes()]);
+        assert!(!valid(&s).await.contains(&t1.into_bytes()));
     }
 
     #[tokio::test]

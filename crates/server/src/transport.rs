@@ -7,11 +7,13 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use async_trait::async_trait;
+use parking_lot::Mutex;
 use quark_core::xml::{stream_header, StreamEvent, StreamReader, XmlError};
 use quark_core::{ns, Element};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufWriter, ReadBuf, ReadHalf, WriteHalf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter, ReadBuf, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 
 use crate::sasl::ChannelBindings;
@@ -304,8 +306,12 @@ impl Transport for TcpTransport {
 
     async fn close(&mut self, err: Option<&StreamError>) {
         let ns = self.stream_ns;
-        if let Ok(w) = self.writer() {
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), close_stream(w, err, ns)).await;
+        let Some(mut w) = self.writer.take() else { return };
+        // During negotiation the stream only ends without an error when the client closed it
+        // (or the connection is gone, which the linger notices at once).
+        let peer_closed = if err.is_none() { self.reader.take().map(StreamReader::into_inner) } else { None };
+        if tokio::time::timeout(Duration::from_secs(5), write_close(&mut w, err, ns)).await.is_ok_and(|r| r.is_ok()) {
+            linger(w, peer_closed);
         }
     }
 
@@ -368,42 +374,94 @@ impl Transport for TcpTransport {
 
     fn split(self: Box<Self>) -> (Box<dyn StanzaReader>, Box<dyn StanzaWriter>) {
         let me = *self;
-        let reader = me.reader.map(|r| Box::new(TcpReader(r)) as Box<dyn StanzaReader>).unwrap_or_else(|| Box::new(Closed));
+        let peer_closed = PeerClosed::default();
+        let reader = me
+            .reader
+            .map(|r| Box::new(TcpReader { r: Some(r), read: 0, peer_closed: peer_closed.clone() }) as Box<dyn StanzaReader>)
+            .unwrap_or_else(|| Box::new(Closed));
         let writer = me
             .writer
-            .map(|w| Box::new(TcpWriter { w, stream_ns: me.stream_ns, written: me.written }) as Box<dyn StanzaWriter>)
+            .map(|w| Box::new(TcpWriter { w: Some(w), stream_ns: me.stream_ns, written: me.written, peer_closed }) as Box<dyn StanzaWriter>)
             .unwrap_or_else(|| Box::new(Closed));
         (reader, writer)
     }
 }
 
-async fn close_stream<W: AsyncWrite + Unpin>(w: &mut W, err: Option<&StreamError>, stream_ns: &str) -> io::Result<()> {
+/// Where the reading half goes once the client has closed its stream, so the writer can wait for
+/// the client to hang up before closing the connection.
+type PeerClosed = Arc<Mutex<Option<ReadHalf<Io>>>>;
+
+/// How long we wait for a client that closed its stream to close the connection.
+const LINGER_PEER_CLOSE: Duration = Duration::from_secs(2);
+/// How long our closing tag (or stream error) gets to arrive before TLS's own close does.
+const LINGER_OURS: Duration = Duration::from_millis(100);
+
+/// Our stream error, if any, and closing tag, flushed.
+async fn write_close(w: &mut TcpOut, err: Option<&StreamError>, stream_ns: &str) -> io::Result<()> {
     let mut s = String::new();
     if let Some(e) = err {
         e.to_element().write_into_stream(&mut s, stream_ns);
     }
     s.push_str("</stream:stream>");
     w.write_all(s.as_bytes()).await?;
-    w.flush().await?;
-    w.shutdown().await
+    w.flush().await
 }
 
-struct TcpReader(StreamReader<ReadHalf<Io>>);
+/// Closes the connection once the closing tag has had its chance to be read, in a task of its
+/// own so nothing waits for it. Some TLS stacks (Smack's) drop text that arrives in the same
+/// read as the TLS close, so after answering a client's `</stream:stream>` we let the client
+/// hang up first (RFC 6120 §4.4), and after closing the stream ourselves we pause briefly.
+/// Both waits are short and bounded, whatever the peer does.
+fn linger(mut w: TcpOut, peer_closed: Option<ReadHalf<Io>>) {
+    tokio::spawn(async move {
+        match peer_closed {
+            Some(mut r) => {
+                let mut buf = [0u8; 1024];
+                let _ = tokio::time::timeout(LINGER_PEER_CLOSE, async { while matches!(r.read(&mut buf).await, Ok(n) if n > 0) {} }).await;
+            }
+            None => tokio::time::sleep(LINGER_OURS).await,
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(1), w.shutdown()).await;
+    });
+}
+
+struct TcpReader {
+    /// None once the client closed its stream (the half is then in `peer_closed`).
+    r: Option<StreamReader<ReadHalf<Io>>>,
+    read: u64,
+    peer_closed: PeerClosed,
+}
 
 #[async_trait]
 impl StanzaReader for TcpReader {
     async fn read(&mut self) -> Result<Option<StreamEvent>, XmlError> {
-        self.0.next().await
+        let Some(r) = self.r.as_mut() else { return Ok(None) };
+        let ev = r.next().await;
+        if matches!(ev, Ok(Some(StreamEvent::Close))) {
+            if let Some(r) = self.r.take() {
+                self.read = r.bytes_read();
+                *self.peer_closed.lock() = Some(r.into_inner());
+            }
+        }
+        ev
     }
     fn bytes_read(&self) -> u64 {
-        self.0.bytes_read()
+        self.r.as_ref().map_or(self.read, |r| r.bytes_read())
     }
 }
 
 pub struct TcpWriter {
-    w: TcpOut,
+    /// None once closed.
+    w: Option<TcpOut>,
     stream_ns: &'static str,
     written: Arc<AtomicU64>,
+    peer_closed: PeerClosed,
+}
+
+impl TcpWriter {
+    fn w(&mut self) -> io::Result<&mut TcpOut> {
+        self.w.as_mut().ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "stream closed"))
+    }
 }
 
 #[async_trait]
@@ -413,18 +471,27 @@ impl StanzaWriter for TcpWriter {
     }
     async fn write(&mut self, el: &Element) -> io::Result<()> {
         let xml = el.to_stream_xml(self.stream_ns);
-        self.w.write_all(xml.as_bytes()).await
+        self.w()?.write_all(xml.as_bytes()).await
     }
     async fn flush(&mut self) -> io::Result<()> {
-        self.w.flush().await
+        match self.w.as_mut() {
+            Some(w) => w.flush().await,
+            None => Ok(()),
+        }
     }
     async fn keepalive(&mut self) -> io::Result<()> {
-        self.w.write_all(b" ").await?;
-        self.w.flush().await
+        let w = self.w()?;
+        w.write_all(b" ").await?;
+        w.flush().await
     }
     async fn close(&mut self, err: Option<&StreamError>) {
         let ns = self.stream_ns;
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), close_stream(&mut self.w, err, ns)).await;
+        let Some(mut w) = self.w.take() else { return };
+        // Only an answer to the client's own closing tag waits for the client to hang up.
+        let peer_closed = if err.is_none() { self.peer_closed.lock().take() } else { None };
+        if tokio::time::timeout(Duration::from_secs(5), write_close(&mut w, err, ns)).await.is_ok_and(|r| r.is_ok()) {
+            linger(w, peer_closed);
+        }
     }
 }
 

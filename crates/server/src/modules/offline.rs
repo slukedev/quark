@@ -45,7 +45,9 @@ pub fn storable(msg: &Element) -> bool {
         || msg.get_child("x", ns::MUC_USER).is_some_and(|x| x.has_child("invite", ns::MUC_USER))
 }
 
-/// Hands stored messages to a session that just came online, oldest first.
+/// Hands stored messages to a session that just came online, oldest first. A Bind2 session
+/// gets them from the archive instead (XEP-0386 §3.2), so those are only cleared; messages the
+/// archive doesn't have (history off, or the account's archive preferences) are still sent.
 pub async fn flush(srv: &Arc<Server>, host: &Arc<Host>, session: &Arc<SessionHandle>) {
     let Some(user) = session.jid.node().map(str::to_string) else { return };
     let h = host.domain.clone();
@@ -64,16 +66,32 @@ pub async fn flush(srv: &Arc<Server>, host: &Arc<Host>, session: &Arc<SessionHan
             return;
         }
     };
-    let mut rows = rows;
+    let mut rows: Vec<(i64, i64, Element)> =
+        rows.into_iter().filter_map(|(id, stamp, xml)| Some((id, stamp, Element::parse(&xml).ok()?))).collect();
     rows.sort_by_key(|r| r.0);
-    for (_, stamp, xml) in rows {
-        let Ok(mut m) = Element::parse(&xml) else { continue };
+    let bare = session.jid.to_bare();
+    let archived = if session.info.bind2 && host.settings().history.on() {
+        let ids = rows.iter().filter_map(|(_, _, m)| archive_id(m, &bare)).collect();
+        super::mam::archived(srv, &bare, ids).await
+    } else {
+        Default::default()
+    };
+    for (_, stamp, mut m) in rows {
+        if archive_id(&m, &bare).is_some_and(|id| archived.contains(&id)) {
+            continue;
+        }
         m.set_attr("to", session.jid.to_string());
         if !m.has_child("delay", ns::DELAY) {
             m.append(quark_core::stanza::delay(&host.domain, stamp));
         }
         session.send(m);
     }
+}
+
+/// The id our archive gave a message for this account (XEP-0359), if it was archived.
+fn archive_id(msg: &Element, account: &quark_core::Jid) -> Option<String> {
+    let by = account.to_string();
+    msg.children().find(|c| c.is("stanza-id", ns::SID) && c.attr("by") == Some(by.as_str())).and_then(|c| c.attr("id")).map(str::to_string)
 }
 
 pub struct Offline;
